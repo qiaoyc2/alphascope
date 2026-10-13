@@ -8,7 +8,11 @@ version = "0.1.0"
 description = "Foundation for an evidence-backed financial research agent"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.9,<3"]
+dependencies = [
+    "pydantic>=2.9,<3",
+    "pandas>=2.2,<4",
+    "yfinance>=0.2.66,<1",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
