@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pandas>=2.2,<4",
     "yfinance>=0.2.66,<1",
+    "requests>=2.32,<3",
 ]
 
 [project.optional-dependencies]

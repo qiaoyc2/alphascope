@@ -1,0 +1,14 @@
+# News source suitability (M2B follow-up)
+
+Reviewed October 12, 2026 for **automated, personal, non-commercial research**. Public access alone was not treated as permission for automated analysis.
+
+| Source | Terms and technical finding | Decision |
+| --- | --- | --- |
+| [DOJ press-release API](https://www.justice.gov/developer/api-documentation/api_v1) | The DOJ explicitly offers the API to developers and documents title filtering and a 4 requests/second threshold. Its [legal policy](https://www.justice.gov/legalpolicies) says DOJ-created website information is generally public domain, with third-party exceptions. A title-filtered JSON request returned HTTP 200 and official DOJ links. | Default news adapter for official regulatory announcements; paced at 1 request/second. |
+| [SEC EDGAR](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Official public submissions API and filing documents were live-tested in M2B. [SEC developer guidance](https://www.sec.gov/about/developer-resources) permits moderate declared access below 10 requests/second. | Existing filings tool supplies company disclosures and 8-K announcements; keep separate from news headlines. |
+| [Google News RSS](https://news.google.com/rss/search?q=Alphabet) | Live feed worked, but its own copyright element limits use to rendering results within a personal, non-commercial feed reader. | Do not configure for the automated agent. Retain only for manual feed-reader display. |
+| [Alphabet Investor Relations](https://abc.xyz/investor/) | Current site offers news pages and email alerts, but no verified current RSS endpoint or permission for automated analysis. | No adapter. Company-specific feeds need individual review. |
+| [The Guardian RSS](https://www.theguardian.com/help/feeds) | Its [terms](https://www.theguardian.com/help/terms-of-service) restrict automated reading, data analysis, and AI use without written approval, including feed content. | No adapter. |
+| [GDELT Project DOC API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) | [GDELT dataset terms](https://gdeltproject.org/about.html#termsofuse) allow broad research use with attribution; they do not license linked publisher article text. Repeated paced DOC API requests from this environment returned HTTP 429, so live availability was not verified. | Candidate for a later retry; no adapter now. |
+
+The DOJ API is a narrow source. It searches press-release **titles** and inspects only the first 50 results. Its date field is preserved as a date, without inventing a publication time. It does not supply independent reporting, earnings coverage, or complete company news. A future agent should state this gap and continue to use the SEC and market-data tools. Do not add general publisher content to the agent without verifying that source's terms and access path.
