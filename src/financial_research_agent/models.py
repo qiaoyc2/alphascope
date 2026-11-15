@@ -52,6 +52,47 @@ class ResearchStatus(StrEnum):
     FAILED = "failed"
 
 
+class ResearchType(StrEnum):
+    CAUSAL_PRICE_MOVE = "causal_price_move"
+    PRICE_COMPARISON = "price_comparison"
+    REGULATORY = "regulatory"
+    FILINGS = "filings"
+    OTHER = "other"
+
+
+class PricePremise(StrEnum):
+    RISE = "rise"
+    DECLINE = "decline"
+    OUTPERFORM = "outperform"
+    UNDERPERFORM = "underperform"
+
+
+class ObservationProvenance(StrEnum):
+    UNSPECIFIED = "unspecified"
+    LIVE_PROVIDER = "live_provider"
+    HISTORICAL_FIXTURE = "historical_fixture"
+    USER_INPUT = "user_input"
+
+
+class MarketMovement(ResearchModel):
+    """A reported return for the specified ticker and inclusive period."""
+
+    ticker: NonEmptyStr
+    start_date: date
+    end_date: date
+    return_pct: float = Field(allow_inf_nan=False)
+    benchmark: NonEmptyStr | None = None
+    benchmark_return_pct: float | None = Field(default=None, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def check_measurement(self) -> Self:
+        if self.start_date > self.end_date:
+            raise ValueError("market movement start date is after its end date")
+        if (self.benchmark is None) != (self.benchmark_return_pct is None):
+            raise ValueError("benchmark and its return must be provided together")
+        return self
+
+
 class ResearchGoal(ResearchModel):
     query: NonEmptyStr
     objective: NonEmptyStr
@@ -61,6 +102,11 @@ class ResearchGoal(ResearchModel):
     end_date: date | None = None
     assumptions: list[NonEmptyStr] = Field(default_factory=list)
     unresolved_details: list[NonEmptyStr] = Field(default_factory=list)
+    research_type: ResearchType = ResearchType.OTHER
+    benchmark: NonEmptyStr | None = None
+    temporal_expression: NonEmptyStr | None = None
+    price_premise: PricePremise | None = None
+    needs_clarification: bool = False
 
     @model_validator(mode="after")
     def check_date_range(self) -> Self:
@@ -75,6 +121,7 @@ class ResearchAction(ResearchModel):
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     purpose: NonEmptyStr
     related_hypothesis_ids: list[NonEmptyStr] = Field(default_factory=list)
+    target_information_gap: NonEmptyStr | None = None
     status: ActionStatus = ActionStatus.PLANNED
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
@@ -125,6 +172,9 @@ class Observation(ResearchModel):
     action_id: NonEmptyStr
     result_id: NonEmptyStr
     summary: NonEmptyStr
+    provenance: ObservationProvenance = ObservationProvenance.UNSPECIFIED
+    independently_verified: bool = False
+    market_movement: MarketMovement | None = None
     recorded_at: datetime = Field(default_factory=utc_now)
 
 
@@ -162,6 +212,8 @@ class Hypothesis(ResearchModel):
     contradicting_evidence_ids: list[NonEmptyStr] = Field(default_factory=list)
     research_gaps: list[NonEmptyStr] = Field(default_factory=list)
     last_updated: datetime = Field(default_factory=utc_now)
+    assessment_observation_ids: list[NonEmptyStr] = Field(default_factory=list)
+    assessment_reason: NonEmptyStr | None = None
 
     @model_validator(mode="after")
     def check_evidence_roles(self) -> Self:
@@ -268,6 +320,7 @@ class ResearchState(ResearchModel):
         for hypothesis in self.hypotheses:
             _check_refs(hypothesis.supporting_evidence_ids, evidence_ids, "evidence")
             _check_refs(hypothesis.contradicting_evidence_ids, evidence_ids, "evidence")
+            _check_refs(hypothesis.assessment_observation_ids, observation_ids, "observation")
         gain_action_ids = [entry.action_id for entry in self.information_gain_history]
         _check_refs(gain_action_ids, set(completed_by_id), "information gain action")
         return self

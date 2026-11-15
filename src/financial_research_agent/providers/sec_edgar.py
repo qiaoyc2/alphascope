@@ -109,6 +109,23 @@ class SecExcerpt(ResearchModel):
     api_call_count: int = Field(ge=0)
     provider: str = "sec_edgar"
     source_type: str = "official_sec_primary_document_excerpt"
+    truncated: bool | None = None
+    truncation_reason: str | None = None
+    characters_returned: int | None = Field(default=None, ge=0)
+    max_excerpt_characters: int | None = Field(default=None, ge=1)
+    section_identifier: NonEmptyStr | None = None
+
+    @model_validator(mode="after")
+    def check_excerpt_metadata(self) -> Self:
+        if self.truncated and not self.extraction_incomplete:
+            raise ValueError("a truncated excerpt must be marked incomplete")
+        if self.truncation_reason and self.truncated is not True:
+            raise ValueError("a truncation reason requires a truncated excerpt")
+        if self.characters_returned is not None and self.characters_returned != len(self.excerpt):
+            raise ValueError("excerpt character count does not match the returned text")
+        if self.max_excerpt_characters is not None and len(self.excerpt) > self.max_excerpt_characters:
+            raise ValueError("excerpt exceeds its declared character limit")
+        return self
 
 
 class SecProvider(Protocol):
@@ -368,7 +385,9 @@ class SecEdgarProvider:
         return SecExcerpt(company_name=filing.company_name, cik=filing.cik, accession_number=filing.accession_number,
                           form=filing.form, filing_date=filing.filing_date, document_url=url, excerpt=excerpt,
                           retrieved_at=utc_now(), extraction_incomplete=incomplete, limitations=limitations,
-                          api_call_count=calls)
+                          api_call_count=calls, truncated=truncated,
+                          truncation_reason="character_limit" if truncated else None,
+                          characters_returned=len(excerpt), max_excerpt_characters=self.excerpt_length)
 
 
 def _column(recent: dict, key: str, index: int) -> str | None:

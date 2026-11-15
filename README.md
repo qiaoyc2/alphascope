@@ -27,3 +27,14 @@ export ALPHASCOPE_SEC_USER_AGENT="AlphaScope/0.1 contact=you@example.com"
 ```
 
 The default news source is the DOJ's public press-release API. It covers official U.S. government announcements with a title match, not general financial news or company earnings. It returns release dates without verified publication times. The Google News RSS adapter remains available only for personal, non-commercial feed-reader display; its feed terms do not support use in the later automated agent loop. See [news source suitability](docs/news_source_suitability.md) for the source review and remaining limits. SEC lookup uses the official ticker mapping and recent submissions only; older submission batches are not searched. DOJ and SEC requests are each paced to one per second within this process. Downloads are bounded, and filing documents are not fetched until `--excerpt` is requested.
+
+Milestone 3A adds local structured LLM recommendations without tool execution. The demo automatically loads the repository `.env`; existing shell variables take precedence. See `.env.example` for the baseline: `LLM_PROVIDER=ollama`, `LLM_MODEL=qwen3:8b`, `LLM_TEMPERATURE=0`, `LLM_NUM_CTX=4096`, `OLLAMA_BASE_URL=http://localhost:11434`, and `LLM_THINKING=false`. Only loopback endpoints are accepted; redirects and environment HTTP proxies are disabled. `.env` stays ignored by Git.
+
+```powershell
+# Windows (POSIX: use .venv/bin/python instead)
+.venv/Scripts/python.exe -m pip install -e '.[dev]'
+.venv/Scripts/python.exe -m pytest
+.venv/Scripts/python.exe examples/llm_decision_demo.py --replan
+```
+
+Ollama must already be installed. If unavailable, run `ollama serve`; if the configured model is missing, run `ollama pull qwen3:8b`. The demo uses Ollama's [structured output API](https://docs.ollama.com/api/chat) and Pydantic validation. `--replan` adds the labeled historical fixture, without fetching financial data or changing the research objective. Both decisions require human review: schema validity does not establish factual correctness. `LLM_TIMEOUT_SECONDS` defaults to 60 per HTTP attempt, `LLM_MAX_RETRIES` to 1 (maximum 2), and `LLM_NUM_PREDICT` to 512. Only transient transport/server errors are retried; malformed decisions are rejected. Performance is returned with each result/error and available through the provider's INFO logger; prompts and hidden reasoning are excluded. Missing token/timing metadata remains null. Thinking can be enabled with `LLM_THINKING=true`, but the baseline is disabled and two examples cannot establish reliability.

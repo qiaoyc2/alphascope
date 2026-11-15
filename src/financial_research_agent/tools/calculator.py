@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import statistics
 from datetime import date, datetime
@@ -20,6 +21,7 @@ from financial_research_agent.models import (
     ToolResult,
     utc_now,
 )
+from financial_research_agent.tools import ToolName
 
 
 class CalculationErrorCode(StrEnum):
@@ -254,8 +256,36 @@ _CalculatorArgs = Annotated[
 _ARGUMENT_ADAPTER = TypeAdapter(_CalculatorArgs)
 
 
+def validate_calculation_arguments(arguments: dict) -> dict:
+    """Validate a planned calculation without evaluating it."""
+    args = _ARGUMENT_ADAPTER.validate_json(json.dumps(arguments, allow_nan=False), strict=True)
+    if isinstance(args, _PercentageReturnArgs):
+        _finite_number(args.starting_price, "starting_price", positive=True)
+        _finite_number(args.ending_price, "ending_price", positive=True)
+    elif isinstance(args, _RelativePerformanceArgs):
+        _finite_number(args.stock_return_pct, "stock_return_pct")
+        _finite_number(args.benchmark_return_pct, "benchmark_return_pct")
+    elif isinstance(args, _MovingAverageArgs):
+        if args.window < 1:
+            raise ValueError("window must be positive")
+        _prices(args.prices, args.window)
+    elif isinstance(args, _HistoricalVolatilityArgs):
+        if args.trading_periods_per_year < 1:
+            raise ValueError("trading_periods_per_year must be positive")
+        _prices(args.prices, 3)
+    elif isinstance(args, _VolumeChangeArgs):
+        if args.current_volume < 0 or min(args.baseline_volumes, default=-1) < 0 or not any(args.baseline_volumes):
+            raise ValueError("volumes must be nonnegative with a positive baseline")
+    elif isinstance(args, _ReturnCorrelationArgs):
+        if len(args.stock_prices.keys() & args.benchmark_prices.keys()) < 3:
+            raise ValueError("at least three common pricing dates are required")
+        for prices in (args.stock_prices, args.benchmark_prices):
+            _prices(list(prices.values()), 3)
+    return args.model_dump(mode="json")
+
+
 class CalculatorTool:
-    name = "calculator"
+    name = ToolName.CALCULATOR
 
     def execute(self, action: ResearchAction) -> ToolResult:
         if action.tool_name != self.name:

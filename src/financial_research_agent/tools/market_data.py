@@ -23,6 +23,7 @@ from financial_research_agent.providers.market_data import (
     PriceHistory,
     PriceHistoryRequest,
 )
+from financial_research_agent.tools import ToolName
 from financial_research_agent.tools.calculator import (
     CalculationError,
     percentage_return,
@@ -115,7 +116,7 @@ def compare_histories(
 
 
 class MarketDataTool:
-    name = "market_data"
+    name = ToolName.MARKET_DATA
 
     def __init__(self, provider: MarketDataProvider):
         self.provider = provider

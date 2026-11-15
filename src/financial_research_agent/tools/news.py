@@ -10,10 +10,11 @@ from pydantic import ValidationError
 from financial_research_agent.models import ExecutionMetadata, SourceReference, ToolError, ToolResult, utc_now
 from financial_research_agent.providers.http_client import HttpFailure
 from financial_research_agent.providers.news import NewsProvider, NewsRequest, NewsSearchResult
+from financial_research_agent.tools import ToolName
 
 
 class NewsTool:
-    name = "news"
+    name = ToolName.NEWS
 
     def __init__(self, provider: NewsProvider):
         self.provider = provider

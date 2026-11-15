@@ -89,6 +89,12 @@ def add_research_gap(state: ResearchState, gap: str) -> ResearchState:
     return _updated(state, research_gaps=[*state.research_gaps, gap])
 
 
+def resolve_research_gap(state: ResearchState, gap: str) -> ResearchState:
+    if gap not in state.research_gaps:
+        return state
+    return _updated(state, research_gaps=[item for item in state.research_gaps if item != gap])
+
+
 def record_information_gain(
     state: ResearchState, record: InformationGainRecord
 ) -> ResearchState:

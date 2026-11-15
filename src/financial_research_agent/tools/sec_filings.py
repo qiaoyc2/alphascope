@@ -9,10 +9,11 @@ from pydantic import ValidationError
 
 from financial_research_agent.models import ExecutionMetadata, SourceReference, ToolError, ToolResult, utc_now
 from financial_research_agent.providers.sec_edgar import SecError, SecExcerpt, SecFiling, SecFilingRequest, SecFilingsResult, SecProvider
+from financial_research_agent.tools import ToolName
 
 
 class SecFilingsTool:
-    name = "sec_filings"
+    name = ToolName.SEC_FILINGS
 
     def __init__(self, provider: SecProvider):
         self.provider = provider

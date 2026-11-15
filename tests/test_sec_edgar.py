@@ -102,6 +102,17 @@ def test_document_extraction_and_size_limit():
     assert "hidden" not in excerpt.data["excerpt"] and "bad()" not in excerpt.data["excerpt"]
     assert excerpt.data["source_type"] == "official_sec_primary_document_excerpt"
     assert str(excerpt.sources[0].url) == filing["primary_document_url"]
+    assert excerpt.data["truncated"] is False
+    assert excerpt.data["characters_returned"] == len(excerpt.data["excerpt"])
+    assert excerpt.data["max_excerpt_characters"] == 100
+    long_html = b"<html><body><p>" + (b"word " * 40) + b"</p></body></html>"
+    clipped = SecFilingsTool(provider(response(long_html, raw=True), excerpt_length=100)).get_document_excerpt(
+        action_id="clipped", filing=filing,
+    )
+    assert clipped.success and clipped.data["extraction_incomplete"] is True
+    assert clipped.data["truncated"] is True and clipped.data["truncation_reason"] == "character_limit"
+    assert clipped.data["characters_returned"] == clipped.data["max_excerpt_characters"] == 100
+    assert clipped.data["section_identifier"] is None
     oversized = SecFilingsTool(provider(response(b"x", raw=True, headers={"Content-Length": "3000"}), max_document_bytes=1024)).get_document_excerpt(action_id="e", filing=filing)
     assert oversized.error.code == "RESPONSE_TOO_LARGE"
 
