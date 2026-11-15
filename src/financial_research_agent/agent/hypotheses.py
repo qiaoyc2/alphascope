@@ -11,7 +11,7 @@ from pydantic import Field, StringConstraints, model_validator
 
 from financial_research_agent.agent.state import add_hypothesis, update_hypothesis
 from financial_research_agent.models import (
-    Hypothesis, HypothesisStatus, NonEmptyStr, ResearchGoal, ResearchModel, ResearchState,
+    Hypothesis, HypothesisStatus, NonEmptyStr, ObservationOutcome, ResearchGoal, ResearchModel, ResearchState,
     ResearchType, ToolResult, _check_refs, utc_now,
 )
 from financial_research_agent.providers.llm import LLMPerformance, LLMProvider
@@ -47,6 +47,10 @@ class HypothesisUpdate(ResearchModel):
         return self
 
 
+class HypothesisProposalError(ValueError):
+    """The model did not supply enough distinct hypotheses."""
+
+
 def initialize_research(
     goal: ResearchGoal, provider: LLMProvider,
 ) -> tuple[ResearchState, LLMPerformance | None]:
@@ -71,9 +75,10 @@ def initialize_research(
         state = add_hypothesis(state, Hypothesis(
             hypothesis_id="h-" + uuid4().hex[:12],
             statement=seed.statement, research_gaps=list(dict.fromkeys(seed.research_gaps)),
+            depends_on_price_premise=goal.price_premise is not None,
         ))
     if len(state.hypotheses) < 2:
-        raise ValueError("hypothesis proposals did not contain two distinct explanations")
+        raise HypothesisProposalError("hypothesis proposals did not contain two distinct explanations")
     return state, result.performance
 
 
@@ -128,6 +133,11 @@ def apply_hypothesis_update(
         raise ValueError("support needs supporting evidence or direct observations")
     if any(not results[observations[item].result_id].success for item in linked_ids):
         raise ValueError("failed results cannot substantiate a hypothesis assessment")
+    if (update.status in {HypothesisStatus.SUPPORTED, HypothesisStatus.WEAKENED, HypothesisStatus.REJECTED}
+        or update.resolved_gaps) and all(
+        observations[item].outcome is ObservationOutcome.EMPTY for item in linked_ids
+    ):
+        raise ValueError("an empty retrieval cannot by itself substantiate a hypothesis assessment")
     _check_refs(update.resolved_gaps, set(current.research_gaps), "hypothesis gap")
     if update.resolved_gaps and all(
         incomplete_sec_excerpt(results[observations[item].result_id]) for item in linked_ids

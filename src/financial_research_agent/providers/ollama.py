@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 import requests
@@ -41,6 +42,12 @@ class OllamaProvider:
         self.close()
 
     def generate(self, prompt: str, schema: type[DecisionT]) -> StructuredLLMResult[DecisionT]:
+        return self.generate_with_budget(prompt, schema, before_attempt=lambda: self.settings.timeout_seconds)
+
+    def generate_with_budget(
+        self, prompt: str, schema: type[DecisionT], *, before_attempt: Callable[[], float],
+    ) -> StructuredLLMResult[DecisionT]:
+        """Check the caller's budget before every HTTP attempt, including retries."""
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
         payload = {
@@ -61,6 +68,7 @@ class OllamaProvider:
         }
         overall_start = time.perf_counter()
         for attempt in range(1, self.settings.max_retries + 2):
+            timeout = min(self.settings.timeout_seconds, before_attempt())
             start = time.perf_counter()
             data: dict[str, Any] = {}
             category: LLMErrorCategory | None = None
@@ -71,7 +79,7 @@ class OllamaProvider:
                 with self.session.post(
                     self.settings.base_url.rstrip("/") + "/api/chat",
                     json=payload,
-                    timeout=self.settings.timeout_seconds,
+                    timeout=timeout,
                     allow_redirects=False,
                 ) as response:
                     status = response.status_code

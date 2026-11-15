@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from hashlib import sha256
 
 from pydantic import Field, JsonValue
 
@@ -89,3 +90,8 @@ def action_signature(tool: ToolName, arguments: dict[str, JsonValue]) -> str:
         for field in ("source_result_ids", "price_basis", "effective_start_date", "effective_end_date"):
             key.pop(field, None)
     return json.dumps(key, sort_keys=True, separators=(",", ":"))
+
+
+def action_fingerprint(tool: ToolName, arguments: dict[str, JsonValue]) -> str:
+    signature = f"{tool.value}:{action_signature(tool, arguments)}"
+    return sha256(signature.encode("utf-8")).hexdigest()

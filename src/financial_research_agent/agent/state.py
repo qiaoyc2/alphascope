@@ -95,6 +95,12 @@ def resolve_research_gap(state: ResearchState, gap: str) -> ResearchState:
     return _updated(state, research_gaps=[item for item in state.research_gaps if item != gap])
 
 
+def finish_research(state: ResearchState, status: ResearchStatus, stop_reason: str) -> ResearchState:
+    if status not in {ResearchStatus.COMPLETED, ResearchStatus.STOPPED, ResearchStatus.FAILED}:
+        raise ValueError("a finished state needs a terminal status")
+    return _updated(state, status=status, stop_reason=stop_reason)
+
+
 def record_information_gain(
     state: ResearchState, record: InformationGainRecord
 ) -> ResearchState:

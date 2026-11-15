@@ -71,7 +71,16 @@ class ObservationProvenance(StrEnum):
     UNSPECIFIED = "unspecified"
     LIVE_PROVIDER = "live_provider"
     HISTORICAL_FIXTURE = "historical_fixture"
+    SIMULATED_FIXTURE = "simulated_fixture"
     USER_INPUT = "user_input"
+    DERIVED = "derived"
+
+
+class ObservationOutcome(StrEnum):
+    DATA = "data"
+    EMPTY = "empty"
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
 
 
 class MarketMovement(ResearchModel):
@@ -174,6 +183,7 @@ class Observation(ResearchModel):
     summary: NonEmptyStr
     provenance: ObservationProvenance = ObservationProvenance.UNSPECIFIED
     independently_verified: bool = False
+    outcome: ObservationOutcome | None = None
     market_movement: MarketMovement | None = None
     recorded_at: datetime = Field(default_factory=utc_now)
 
@@ -214,6 +224,7 @@ class Hypothesis(ResearchModel):
     last_updated: datetime = Field(default_factory=utc_now)
     assessment_observation_ids: list[NonEmptyStr] = Field(default_factory=list)
     assessment_reason: NonEmptyStr | None = None
+    depends_on_price_premise: bool = False
 
     @model_validator(mode="after")
     def check_evidence_roles(self) -> Self:
