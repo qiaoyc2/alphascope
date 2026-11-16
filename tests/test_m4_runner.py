@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from threading import Event
 from time import monotonic
@@ -36,6 +37,7 @@ RANGE = {"start_date": START, "end_date": END}
 SPAN = f"{START} to {END}"
 PRICE_Q = f"Why did GOOGL decline from {SPAN}?"
 DOJ_Q = f"What DOJ press-release titles mention Google from {SPAN}?"
+DOJ_CONTENT_Q = f"What did the DOJ press releases about Google announce from {SPAN}?"
 PERF = LLMPerformance(model="mock", request_duration_seconds=.1, total_duration_seconds=.1,
                       attempts=1, input_tokens=20, output_tokens=5, validation_passed=True)
 
@@ -118,7 +120,8 @@ def test_loop_dispatches_three_different_actions_as_the_state_changes():
     def assess(prompt, schema):
         assert "0000000001-26-000001" in prompt and "GOOGL returned" in prompt
         hypothesis = re.search(r'"id":"(h-[^"]+)"', prompt).group(1)
-        evidence = re.findall(r'"id":"(e-[^"]+)"', prompt)[-1]
+        context = json.loads(prompt.split("\nContext:\n", 1)[1].splitlines()[0])
+        evidence = next(row["evidence"][0]["id"] for row in context["attempted_actions"] if row["tool"] == "sec_filings")
         return plan(arguments={}, gap="The filing metadata does not establish a cause.", updates=[{
             "hypothesis_id": hypothesis, "status": "inconclusive", "reason": "A filing record was found, with its cause still unresolved.",
             "supporting_evidence_ids": [evidence],
@@ -155,8 +158,7 @@ def test_contradiction_stops_even_if_planning_budget_is_exhausted(max_steps):
     assert all(h.status is HypothesisStatus.INCONCLUSIVE for h in result.state.hypotheses)
     assert all(h.assessment_observation_ids == [result.state.observations[0].observation_id] for h in result.state.hypotheses)
     assert not result.state.observations[0].independently_verified
-    if max_steps > 1:
-        assert result.steps[-1].note and "incompatible" in result.steps[-1].note
+    assert len(result.steps) == 1 and result.steps[0].quality_gate_terminated
 
 
 def test_positive_regulatory_metadata_can_satisfy_a_scoped_goal():
@@ -208,8 +210,9 @@ def test_failure_is_visible_to_replanner_and_a_different_valid_query_can_recover
 
 @pytest.mark.parametrize("provider", [FixtureNews(), OfflineNews()])
 def test_equivalent_successful_or_failed_actions_are_blocked_measurably(provider):
-    model = Model(draft("regulatory"), plan("news", {"query": "Google", **RANGE}),
-                  plan("news", {"query": " GOOGLE ", **RANGE}), plan("news", {"query": "Google", **RANGE}))
+    narrower = {**RANGE, "start_date": "2026-09-01"}
+    model = Model(draft("regulatory"), plan("news", {"query": "Google", **narrower}),
+                  plan("news", {"query": " GOOGLE ", **narrower}), plan("news", {"query": "Google", **narrower}))
     result = ResearchRunner(model, registry(news=provider)).run(DOJ_Q)
     assert result.stop_reason is StopReason.REPEATED_ACTION
     assert result.statistics.tool_calls == 1 and result.statistics.planning_steps == 3
@@ -260,6 +263,7 @@ def test_sec_excerpt_uses_registered_filing_and_preserves_truncation():
     assert tool_result.data["characters_returned"] == len(tool_result.data["excerpt"])
     assert result.stop_reason is StopReason.INSUFFICIENT_EVIDENCE
     assert all(observation.observation_id not in item.observation_ids for item in result.state.evidence)
+    assert tool_result.data["excerpt"][:100] not in model.prompts[-1][1]
 
 
 def test_unavailable_source_is_not_confused_with_goal_satisfaction():
@@ -277,7 +281,7 @@ def test_unavailable_source_is_not_confused_with_goal_satisfaction():
 def test_limits_end_research_without_turning_partial_results_into_success(limits, remaining):
     model = Model(draft("regulatory"), plan("news", {"query": "Google", **RANGE}),
                   plan("news", {"query": "Alphabet", **RANGE}))
-    result = ResearchRunner(model, registry(news=FixtureNews())).run(DOJ_Q, limits)
+    result = ResearchRunner(model, registry(news=FixtureNews())).run(DOJ_CONTENT_Q, limits)
     assert result.stop_reason is StopReason.BUDGET_EXHAUSTED
     assert remaining in result.stop_detail
     assert result.statistics.tool_calls == 1 and result.state.status is ResearchStatus.STOPPED
@@ -345,8 +349,8 @@ def test_ollama_retries_cannot_spend_more_than_the_physical_request_budget(monke
 
 def test_llm_timeout_preserves_goal_and_partial_execution():
     model = Model(draft("regulatory"), plan("news", {"query": "Google", **RANGE}), model_error(LLMErrorCategory.TIMEOUT))
-    result = ResearchRunner(model, registry(news=FixtureNews())).run(DOJ_Q)
+    result = ResearchRunner(model, registry(news=FixtureNews())).run(DOJ_CONTENT_Q)
     assert result.stop_reason is StopReason.LLM_FAILURE
-    assert result.state.goal.query == DOJ_Q and len(result.state.completed_actions) == 1
+    assert result.state.goal.query == DOJ_CONTENT_Q and len(result.state.completed_actions) == 1
     assert result.issues[-1].code == "llm_timeout"
     assert result.steps[-1].validation == "llm_failed"

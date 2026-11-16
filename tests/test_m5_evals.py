@@ -24,7 +24,7 @@ def test_offline_invariants_are_reproducible_without_network(monkeypatch):
 
     monkeypatch.setenv("OPENAI_API_KEY", "unused-synthetic-key")
     monkeypatch.setattr("requests.sessions.Session.request", forbidden)
-    suite = run_suite(repeat=2)
+    suite = run_suite(repeat=2, expectations_version="m5.1")
     assert len(CASES) == 11
     first, second = suite["cases"][:len(CASES)], suite["cases"][len(CASES):]
     for a, b in zip(first, second, strict=True):
@@ -52,14 +52,15 @@ def test_timing_does_not_support_causal_conclusion():
     assert step["final_disposition"] == "insufficient_evidence"
 
 
-def test_premise_conflict_records_raw_tool_and_safe_clarification():
+def test_premise_conflict_stops_without_an_additional_raw_proposal():
     result = evaluate_case(CASES[0])
-    raw = result["steps"][-1]
-    assert raw["raw_proposal"]["action"] == "continue" and raw["raw_proposal"]["tool"] == "news"
-    assert raw["correction_category"] == "premise_conflict"
-    assert raw["recommended_action"] == "clarify" and raw["final_disposition"] == "needs_clarification"
-    assert not raw["tool_executed"] and raw["authorized_tool"] is None
-    assert raw["llm_performance"]["validation_passed"] and raw["remaining_budget"]["tool_calls"] == 2
+    assert result["passed"] and len(result["steps"]) == 1
+    step = result["steps"][0]
+    assert step["raw_proposal"]["action"] == "continue" and step["raw_proposal"]["tool"] == "market_data"
+    assert step["raw_valid"] and step["correction_category"] is None
+    assert step["quality_gate_terminated"] and step["final_disposition"] == "needs_clarification"
+    assert step["tool_executed"] and step["authorized_tool"] == "market_data"
+    assert step["llm_performance"]["validation_passed"] and step["remaining_budget"]["tool_calls"] == 2
 
 
 def test_exhausted_budget_preserves_available_findings():

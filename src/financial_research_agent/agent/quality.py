@@ -12,10 +12,10 @@ from pydantic import Field, model_validator
 
 from financial_research_agent.agent.observe import SourceFact, describe_result
 from financial_research_agent.agent.premise import (
-    MovementReading, assess_premise, comparable_conflicts, market_reading, scoped_readings,
+    MovementReading, PremiseAssessment, assess_premise, comparable_conflicts, market_reading, scoped_readings,
 )
 from financial_research_agent.models import (
-    Evidence, Observation, ObservationOutcome, ObservationProvenance, ResearchAction, ResearchModel,
+    Evidence, Observation, ObservationOutcome, ObservationProvenance, ResearchAction, ResearchGoal, ResearchModel,
     ResearchState, ResearchType, ToolResult,
 )
 from financial_research_agent.providers.market_data import PriceBasis
@@ -122,6 +122,8 @@ class QualityAssessment(ResearchModel):
     remaining_needs: list[str]
     reasons: list[str]
     premise_contradicted: bool = False
+    premise: PremiseAssessment = Field(default_factory=PremiseAssessment)
+    recovery_tools: tuple[ToolName, ...] = ()
 
     @model_validator(mode="after")
     def check_satisfaction(self) -> Self:
@@ -155,6 +157,14 @@ _RAW_PRICE = re.compile(r"\b(?:unadjusted|raw clos(?:e|ing))\b", re.I)
 _ADJUSTED_PRICE = re.compile(r"\badjusted\b", re.I)
 _FORM = re.compile(r"\b(?:10-[KQ]|8-K|20-F|6-K)(?:/A)?\b", re.I)
 _COMPOUND = re.compile(r"\b(?:and|also)\s+(?:what|which|when|how|why|whether|explain|identify|describe)\b", re.I)
+_EXHAUSTIVE = re.compile(r"\b(?:all|each|every|complete|comprehensive|exhaustive|full list|in full)\b", re.I)
+_RELEASE_CONTENT = re.compile(
+    r"\b(?:summari[sz]\w*|contents?|full text|details?|announced|said|did they say|body|bodies)\b", re.I,
+)
+_OTHER_PRICE_METRICS = re.compile(
+    r"\b(?:annualiz\w*|total shareholder|total return|volatility|drawdown|dividends?|volume|intraday|daily|"
+    r"weekly|monthly|opening|highest|lowest|correlation|risk|average|median|in dollars)\b", re.I,
+)
 
 
 def _mentions(text: str, terms: set[str]) -> bool:
@@ -225,10 +235,27 @@ def _retrieve(
         elif tool is ToolName.NEWS:
             if kind != "news_search" or result.data.get("query") != args["query"]:
                 raise ValueError("news result differs from the action")
-            assess.limitations.append("DOJ title metadata covers inspected results within the search scope.")
+            articles = result.data["articles"]
+            source_urls = {str(url) for url in urls}
+            if len(articles) > args["limit"] or any(
+                not _title_in_request(record, args) or record["url"] not in source_urls
+                for record in articles
+            ):
+                raise ValueError("news records or source references differ from the lookup scope")
+            if observation.provenance is ObservationProvenance.LIVE_PROVIDER and any(
+                record["source_type"] != "official_government_press_release"
+                or not any(str(url) == record["url"] and (
+                    url.host == "justice.gov" or (url.host or "").endswith(".justice.gov")
+                ) for url in urls)
+                for record in articles
+            ):
+                raise ValueError("live DOJ lookup requires official press release references")
+            assess.limitations.append(
+                f"Title metadata covers inspected results for {args['query']!r} (up to {args['limit']} titles)."
+            )
             if result.data["invalid_items_skipped"] or len(result.data["articles"]) >= args["limit"]:
                 assess.limitations.append("Invalid items or a result cap may limit search coverage.")
-            if any(_event_in_scope(record, state, terms) for record in result.data["articles"]):
+            if any(_event_in_scope(record, state, terms) for record in articles):
                 assess.relevance = Relevance.RELEVANT
         elif tool is ToolName.SEC_FILINGS:
             if "filing" in args:
@@ -313,6 +340,21 @@ def _event_in_scope(record: dict, state: ResearchState, terms: set[str]) -> bool
     )
 
 
+def _title_in_request(record: dict, args: dict) -> bool:
+    if " ".join(args["query"].casefold().split()) not in " ".join(record["title"].casefold().split()):
+        return False
+    published = record["publication_date"]
+    start, end = args["start_date"], args["end_date"]
+    if published is None:
+        return start is None and end is None
+    return (start is None or start <= published) and (end is None or published <= end)
+
+
+def _matches_period(arguments: dict, goal: ResearchGoal) -> bool:
+    return all(value is None or arguments.get(field) == value.isoformat()
+               for field, value in (("start_date", goal.start_date), ("end_date", goal.end_date)))
+
+
 def _assess_evidence(
     item: Evidence, retrievals: dict[str, _Retrieved], state: ResearchState, terms: set[str],
 ) -> EvidenceCheck:
@@ -356,6 +398,9 @@ def evaluate_quality(state: ResearchState, *, available_tools: tuple[ToolName, .
     terms = {name.casefold() for name in (goal.company, goal.ticker) if name and _mentions(query, {name})}
     results = {item.result_id: item for item in state.tool_results}
     actions = {item.action_id: item for item in state.completed_actions}
+    scoped_observations = {
+        item.observation_id for item in state.observations if _matches_period(actions[item.action_id].arguments, goal)
+    }
     retrievals = {
         item.observation_id: _retrieve(state, item, results[item.result_id], actions[item.action_id], terms)
         for item in state.observations
@@ -372,7 +417,8 @@ def evaluate_quality(state: ResearchState, *, available_tools: tuple[ToolName, .
         retrieved.assessment.duplicate_of = seen_results.get(key)
         seen_results.setdefault(key, oid)
     checks = []
-    distinct: dict[tuple, str] = {}
+    distinct: dict[tuple, tuple[str, bool]] = {}
+    evidence_keys: dict[str, tuple] = {}
     for item in state.evidence:
         check = _assess_evidence(item, retrievals, state, terms)
         if check.valid:
@@ -384,10 +430,20 @@ def evaluate_quality(state: ResearchState, *, available_tools: tuple[ToolName, .
                 (reading.scope, reading.measurement.return_pct, reading.measurement.benchmark_return_pct)
                 for oid in item.observation_ids if (reading := retrievals[oid].movement)
             )
-            check.duplicate_of = distinct.setdefault((*key, scopes), item.evidence_id)
-            if check.duplicate_of == item.evidence_id:
-                check.duplicate_of = None
+            key = (*key, scopes)
+            evidence_keys[item.evidence_id] = key
+            scoped_title = check.relevance is Relevance.RELEVANT and any(
+                oid in scoped_observations and retrievals[oid].assessment.tool is ToolName.NEWS
+                for oid in item.observation_ids
+            )
+            if key not in distinct or (scoped_title and not distinct[key][1]):
+                distinct[key] = (item.evidence_id, scoped_title)
         checks.append(check)
+    for check in checks:
+        if check.valid:
+            preferred_id = distinct[evidence_keys[check.evidence_id]][0]
+            if preferred_id != check.evidence_id:
+                check.duplicate_of = preferred_id
     evidence = {item.evidence_id: item for item in state.evidence}
     usable = [check for check in checks if check.valid and not check.duplicate_of]
     evidenced = {oid for check in checks if check.valid for oid in evidence[check.evidence_id].observation_ids}
@@ -462,6 +518,7 @@ def evaluate_quality(state: ResearchState, *, available_tools: tuple[ToolName, .
     supported = [item for item in findings if item.support_status is SupportStatus.SUPPORTED]
     status, disposition, needs = _outcome(
         state, available_tools, scoped, contradictions, premise.conditional_valid is False, causal, supported,
+        scoped_observations,
     )
     rejected = sum(not check.valid for check in checks)
     reasons = list(dict.fromkeys(needs or ["The scoped factual finding is backed by validated source records."]))
@@ -472,14 +529,62 @@ def evaluate_quality(state: ResearchState, *, available_tools: tuple[ToolName, .
         supported_findings=supported, unverified_claims=[item for item in findings if item not in supported],
         evidence_checks=checks, sources=[item.assessment for item in retrievals.values()],
         contradictions=contradictions, gaps=needs, remaining_needs=needs, reasons=reasons,
-        premise_contradicted=premise.conditional_valid is False,
+        premise_contradicted=premise.conditional_valid is False, premise=premise,
+        recovery_tools=_recovery_tools(state, available_tools or (), scoped, disposition, causal),
     )
+
+
+def _title_lookup(goal: ResearchGoal) -> bool:
+    query = goal.query
+    if _EXHAUSTIVE.search(query) or _RELEASE_CONTENT.search(query):
+        return False
+    match = re.fullmatch(
+        r"\s*(?:(?:what|which)(?: are| were)?|(?:please )?list|(?:please )?show(?: me)?)\s+"
+        r"(?:the\s+)?(?:DOJ|(?:U\.S\. )?Department of Justice)\s+"
+        r"(?:press[- ]release\s+)?(?:titles?|headlines?)\s+"
+        r"(?:(?:were )?found\s+)?(?:mention(?:ing)?|about|involving|for|matching|related to)\s+"
+        r"(.+?)\s*\??\s*", query, re.I,
+    )
+    if not match:
+        return False
+    period = r"(?:from|between|during|in|since|over)\s+"
+    constraint = re.split(r"\s+" + period, match[1], maxsplit=1, flags=re.I)
+    subject = constraint[0].strip(" \"'").casefold()
+    if subject not in {name.casefold() for name in (goal.company, goal.ticker) if name}:
+        return False
+    if len(constraint) == 1:
+        return True
+    resolved = re.sub(r"^" + period, "", goal.temporal_expression or "", flags=re.I)
+    return constraint[1].casefold() == resolved.casefold() and bool(goal.start_date and goal.end_date)
+
+
+def _recovery_tools(
+    state: ResearchState, tools: tuple[ToolName, ...], readings: list[MovementReading],
+    disposition: Disposition, causal: bool,
+) -> tuple[ToolName, ...]:
+    if disposition is not Disposition.CONTINUE:
+        return ()
+    goal = state.goal
+    if causal:
+        # Title metadata can add contemporaneous events. A duplicate replan should target
+        # a source that can add substantive evidence once there is a scoped reading.
+        candidates = {ToolName.SEC_FILINGS} if readings else {ToolName.MARKET_DATA}
+    elif goal.research_type is ResearchType.PRICE_COMPARISON:
+        candidates = {ToolName.MARKET_DATA}
+    elif goal.research_type is ResearchType.REGULATORY:
+        candidates = set() if _EXHAUSTIVE.search(goal.query) or _RELEASE_CONTENT.search(goal.query) else {ToolName.NEWS}
+    elif goal.research_type is ResearchType.FILINGS:
+        candidates = {ToolName.SEC_FILINGS}
+    else:
+        candidates = set(tools) - {ToolName.CALCULATOR}
+    return tuple(tool for tool in tools if tool in candidates)
 
 
 def _outcome(
     state: ResearchState, tools: tuple[ToolName, ...] | None, readings: list[MovementReading],
     contradictions: list[EvidenceConflict], premise_contradicted: bool, causal: bool,
     supported: list[ResearchFinding],
+    scoped_observations: set[str],
 ) -> tuple[QualityStatus, Disposition, list[str]]:
     goal = state.goal
     query = goal.query
@@ -497,16 +602,13 @@ def _outcome(
         len(dates) == 2 and goal.start_date and goal.end_date
         and dates == [goal.start_date.isoformat(), goal.end_date.isoformat()]
     )
+    if not dates and re.search(r"\b(?:from|since|between|during|in|on)\s+(?:the\s+)?(?:\d{4}|q[1-4]|"
+                               r"jan\w*|feb\w*|mar\w*|apr\w*|may|jun\w*|jul\w*|aug\w*|"
+                               r"sep\w*|oct\w*|nov\w*|dec\w*|last|past|this)\b", query, re.I):
+        dates_match = bool(goal.temporal_expression and goal.start_date and goal.end_date)
     simple_request = query.count("?") <= 1 and not _COMPOUND.search(query)
-    actions_by_observation = {
-        obs.observation_id: action.arguments
-        for action in state.completed_actions for obs in state.observations if obs.action_id == action.action_id
-    }
     scoped_findings = [
-        finding for finding in supported if any(all(
-            value is None or actions_by_observation[oid].get(field) == value.isoformat()
-            for field, value in (("start_date", goal.start_date), ("end_date", goal.end_date))
-        ) for oid in finding.observation_ids)
+        finding for finding in supported if scoped_observations.intersection(finding.observation_ids)
     ]
     if causal:
         needs = [] if readings else ["Verify the movement for the requested symbol and period."]
@@ -518,7 +620,12 @@ def _outcome(
         basis = PriceBasis.RAW_CLOSE if _RAW_PRICE.search(query) else (
             PriceBasis.ADJUSTED_CLOSE if _ADJUSTED_PRICE.search(query) else None
         )
-        if (readings and len({item.scope for item in readings}) == 1 and dates_match and simple_request and _RETURN.search(query)
+        covered = readings and readings[0].effective_dates and goal.start_date and goal.end_date and (
+            (readings[0].effective_dates[0] - goal.start_date).days <= 4
+            and (goal.end_date - readings[0].effective_dates[1]).days <= 4
+        )
+        if (covered and len({item.scope for item in readings}) == 1 and dates_match and simple_request and _RETURN.search(query)
+            and not _OTHER_PRICE_METRICS.search(query)
             and goal.ticker and _mentions(query, {goal.ticker})
             and (basis is None or readings[0].price_basis is basis)
             and (not comparative or (goal.benchmark and _mentions(query, {goal.benchmark})))):
@@ -527,11 +634,14 @@ def _outcome(
     elif goal.research_type is ResearchType.REGULATORY:
         preferred = {ToolName.NEWS}
         if (dates_match and simple_request and any(item.kind is ClaimKind.EVENT_RECORD for item in scoped_findings)
-            and re.search(r"\b(?:DOJ|Department of Justice)\b", query, re.I)
-            and re.search(r"\b(?:titles?|headlines?)\b", query, re.I)
-            and not re.search(r"\b(?:all|every|complete|exhaustive)\b", query, re.I)):
+            and _title_lookup(goal)):
             return QualityStatus.SUFFICIENT, Disposition.COMPLETE, []
-        needs = ["Obtain in-scope agency evidence that answers the requested question. Title search has limited coverage."]
+        if _EXHAUSTIVE.search(query):
+            needs = ["Verify coverage across all matching pages for the requested dates and filters."]
+        elif _RELEASE_CONTENT.search(query):
+            needs = ["Obtain release text or corroborated details about what the releases announced."]
+        else:
+            needs = ["Verify the requested entity, dates and title filters. Search coverage is limited to inspected results."]
     elif goal.research_type is ResearchType.FILINGS:
         preferred = {ToolName.SEC_FILINGS}
         requested_forms = {form.upper() for form in _FORM.findall(query)}

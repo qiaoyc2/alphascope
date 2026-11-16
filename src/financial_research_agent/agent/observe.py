@@ -73,7 +73,7 @@ def _news_finding(result: ToolResult, provenance: ObservationProvenance) -> Find
     facts = tuple(SourceFact(
         f"DOJ release title: {item.title[:240]} ({item.publication_date or 'date unavailable'}).",
         str(item.url), item.retrieved_at, item.published_at,
-    ) for item in items)
+    ) for item in news.articles)
     return Finding(summary, facts=facts)
 
 
@@ -138,7 +138,8 @@ def observe_result(
     evidence = []
     for fact in finding.facts:
         key = (fact.url, fact.claim)
-        if key in known and result.tool_name != ToolName.MARKET_DATA:
+        # Price and title captures can establish different scopes despite repeating a fact.
+        if key in known and result.tool_name == ToolName.SEC_FILINGS:
             continue
         known.add(key)
         evidence.append(Evidence(

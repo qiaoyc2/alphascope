@@ -12,7 +12,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evals.cases import CASES, LOCAL_CASE_IDS, Check, EvalCase, ScriptedProvider, conflicting_state, registry
+from evals.cases import CASES, LOCAL_CASE_IDS, Check, EvalCase, Expectations, ScriptedProvider, conflicting_state, registry
 from financial_research_agent.agent.quality import (
     Completeness, Disposition, QualityAssessment, SupportStatus, evaluate_quality,
 )
@@ -32,8 +32,12 @@ METRIC_DEFINITIONS = {
     "tool_execution_success_rate": "Successful dispatched tool results / dispatched tool actions.",
     "correct_stopping_rate": "Cases meeting expected terminal stop reason and quality / cases evaluated. Includes E4's quality-only stop recommendation.",
     "quality_gate_rejections": "Planning steps whose correction category is quality_gate_rejection.",
+    "guardrail_interventions": "Planning steps with a structured correction or rejection category.",
+    "quality_gate_terminations": "Runner outcomes selected independently of the planner after assessing state.",
+    "quality_gate_completions": "Independent quality-gate terminations with goal_satisfied.",
     "unsupported_claims": "Findings assessed as unsupported. Provisional hypotheses marked not_evaluated are reported separately.",
-    "premature_satisfactions": "Final goal_satisfied outcomes that are unsatisfied by the gate or fail the case's expected stopping checks.",
+    "premature_satisfactions": "Final goal_satisfied outcomes without gate support, required findings, or valid provenance.",
+    "unexpected_satisfactions": "Final goal_satisfied outcomes that fail the versioned stop, quality, satisfaction or required findings checks (the M5 premature_satisfactions formula).",
     "raw_premature_satisfaction_proposals": "Raw satisfaction requests vetoed by the quality gate.",
     "provenance": "Valid / examined evidence records.",
     "retries_reported": "Additional attempts reported by completed LLM generations. Interrupted generations can have unreported retry details.",
@@ -48,10 +52,28 @@ def _ratio(numerator: int, denominator: int) -> dict:
             "value": numerator / denominator if denominator else None}
 
 
+def _expectations(case: EvalCase, version: str) -> Expectations:
+    if version == "m5":
+        return case.expectations
+    if version != "m5.1":
+        raise ValueError("unknown evaluation expectations version")
+    if case.case_id != "E6":
+        return case.expectations
+    # E6's historical expectations deliberately consume duplicate proposals after
+    # a sufficient title lookup. The same fixture now stops at the first retrieval.
+    return Expectations.model_validate({
+        **case.expectations.model_dump(),
+        "stops": {StopReason.GOAL_SATISFIED},
+        "checks": case.expectations.checks - {Check.DUPLICATE_SOURCE, Check.DUPLICATE_PROPOSAL} | {Check.SOURCE_LIMITATIONS},
+        "max_tool_calls": 1,
+    })
+
+
 def _checks(
     case: EvalCase, state: ResearchState, quality: QualityAssessment, stop: StopReason, run: ResearchRun | None,
+    *, expectations_version: str,
 ) -> dict[str, bool]:
-    expected = case.expectations
+    expected = _expectations(case, expectations_version)
     steps = run.steps if run else []
     limits = case.limits
     executed = [step.authorized_tool for step in steps if step.tool_executed]
@@ -99,13 +121,13 @@ def _checks(
 
 def _collect(
     case: EvalCase, state: ResearchState, quality: QualityAssessment, stop: StopReason, run: ResearchRun | None,
-    *, mode: str, trial: int, live_sources: bool,
+    *, mode: str, trial: int, live_sources: bool, expectations_version: str,
 ) -> dict:
-    checks = _checks(case, state, quality, stop, run)
+    checks = _checks(case, state, quality, stop, run, expectations_version=expectations_version)
     statistics = run.statistics if run else None
     # Artifact includes evidence links and structured telemetry. Model prose, prompts and raw result bodies stay in memory.
     assessment = quality.model_dump(mode="json", exclude={
-        "unverified_claims": {"__all__": {"statement"}}, "sources": {"__all__": {"limitations"}},
+        "unverified_claims": {"__all__": {"statement"}}, "premise": {"summary"},
     })
     result_by_action = {item.action_id: item for item in state.tool_results}
     actions = {item.action_id: item for item in state.completed_actions}
@@ -124,6 +146,7 @@ def _collect(
         "data_mode": "live_sources_enabled" if live_sources and case.live_source else "fixtures",
         "quality_only": case.quality_only,
         "passed": all(checks.values()), "checks": checks, "stop_reason": stop.value,
+        "quality_gate_terminated": run.quality_gate_terminated if run else False,
         "quality": assessment, "steps": steps,
         "issues": [item.model_dump(mode="json", exclude={"message"}) for item in run.issues] if run else [],
         "statistics": statistics.model_dump(mode="json") if statistics else None,
@@ -137,6 +160,7 @@ def _collect(
 
 def evaluate_case(
     case: EvalCase, *, provider: LLMProvider | None = None, trial: int = 1, live_sources: bool = False,
+    expectations_version: str = "m5",
 ) -> dict:
     case = EvalCase.model_validate(case)
     if live_sources and provider is None:
@@ -156,7 +180,7 @@ def evaluate_case(
         state, quality, stop = run.state, run.quality, run.stop_reason
         assert quality is not None
     return _collect(case, state, quality, stop, run, mode="offline" if provider is None else "local",
-                    trial=trial, live_sources=live_sources)
+                    trial=trial, live_sources=live_sources, expectations_version=expectations_version)
 
 
 def summarize(results: list[dict]) -> dict[str, Any]:
@@ -187,6 +211,11 @@ def summarize(results: list[dict]) -> dict[str, Any]:
         "final_action_validity_rate": _ratio(sum(item["tool_authorization_matches"] for item in executions), len(executions)),
         "duplicate_proposal_rate": _ratio(sum(item["correction_category"] == "duplicate_action" for item in raw), len(raw)),
         "tool_execution_success_rate": _ratio(sum(item["tool_success"] is True for item in executions), len(executions)),
+        "guardrail_interventions": sum(bool(item["correction_category"]) for item in steps),
+        "quality_gate_terminations": sum(item["quality_gate_terminated"] for item in results),
+        "quality_gate_completions": sum(
+            item["quality_gate_terminated"] and item["stop_reason"] == StopReason.GOAL_SATISFIED for item in results
+        ),
         "correct_stopping_rate": _ratio(sum(item["checks"]["stop"] and item["checks"]["quality"]
                                            and item["checks"]["satisfaction_consistent"] for item in results), len(results)),
         "quality_gate_rejections": sum(item["correction_category"] == "quality_gate_rejection" for item in steps),
@@ -196,6 +225,13 @@ def summarize(results: list[dict]) -> dict[str, Any]:
         ),
         "unsupported_claims": sum(item["support_status"] == SupportStatus.UNSUPPORTED for item in claims),
         "premature_satisfactions": sum(
+            item["stop_reason"] == StopReason.GOAL_SATISFIED and (
+                not all(item["checks"][check] for check in (
+                    "satisfaction_consistent", "required_findings", "prohibited_findings",
+                )) or not all(check["valid"] for check in item["quality"]["evidence_checks"])
+            ) for item in results
+        ),
+        "unexpected_satisfactions": sum(
             item["stop_reason"] == StopReason.GOAL_SATISFIED and not all(
                 item["checks"][check] for check in ("stop", "quality", "satisfaction_consistent", "required_findings")
             ) for item in results
@@ -217,6 +253,8 @@ def summarize(results: list[dict]) -> dict[str, Any]:
         ],
         "retries_reported": sum(item["attempts"] - 1 for item in generations),
         "tool_calls": sum(item["tool_calls"] for item in stats),
+        "tool_wait_seconds": [item["tool_wait_seconds"] for item in executions if item["tool_wait_seconds"] is not None],
+        "tool_calls_in_flight_at_exit": sum(item["tool_in_flight_at_exit"] for item in steps),
         "stop_reasons": dict(Counter(item["stop_reason"] for item in results)),
         "corrections": dict(Counter(item["correction_category"] for item in steps if item["correction_category"])),
         "observed_stop_quality_by_case": variants,
@@ -224,14 +262,16 @@ def summarize(results: list[dict]) -> dict[str, Any]:
 
 
 def run_suite(cases: tuple[EvalCase, ...] = CASES, *, provider: LLMProvider | None = None,
-              repeat: int = 1, live_sources: bool = False) -> dict:
+              repeat: int = 1, live_sources: bool = False, expectations_version: str = "m5") -> dict:
     if not cases or repeat < 1 or len({case.case_id for case in cases}) != len(cases):
         raise ValueError("a suite requires distinct cases and at least one trial")
-    results = [evaluate_case(case, provider=provider, trial=trial, live_sources=live_sources)
+    results = [evaluate_case(case, provider=provider, trial=trial, live_sources=live_sources,
+                             expectations_version=expectations_version)
                for trial in range(1, repeat + 1) for case in cases]
     metrics = summarize(results)
     metrics["estimated_paid_inference_usd"] = 0 if isinstance(provider, OllamaProvider) else None
-    return {"metric_definitions": METRIC_DEFINITIONS, "metrics": metrics, "cases": results}
+    return {"expectations_version": expectations_version, "metric_definitions": METRIC_DEFINITIONS,
+            "metrics": metrics, "cases": results}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -239,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("offline", "local"), default="offline")
     parser.add_argument("--case", action="append", choices=[case.case_id for case in CASES])
     parser.add_argument("--repeat", type=int, choices=range(1, 6))
+    parser.add_argument("--expectations", choices=("m5", "m5.1"), default="m5")
     parser.add_argument("--live-sources", action="store_true", help="Use approved Yahoo/DOJ providers for applicable local cases.")
     parser.add_argument("--env-file", type=Path, help="Use an existing Ollama settings file in local mode.")
     parser.add_argument("--json", type=Path, metavar="PATH", help="Save metrics and safe structured traces.")
@@ -253,10 +294,11 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             parser.error("local Ollama settings were invalid")
         with open_llm_provider(settings) as provider:
-            report = run_suite(cases, provider=provider, repeat=args.repeat or 2, live_sources=args.live_sources)
+            report = run_suite(cases, provider=provider, repeat=args.repeat or 2, live_sources=args.live_sources,
+                               expectations_version=args.expectations)
         report["local_model"] = settings.model
     else:
-        report = run_suite(cases, repeat=args.repeat or 1)
+        report = run_suite(cases, repeat=args.repeat or 1, expectations_version=args.expectations)
     for item in report["cases"]:
         failures = [check for check, passed in item["checks"].items() if not passed]
         line = (f"{item['case_id']} trial {item['trial']} | {item['data_mode']} | "
