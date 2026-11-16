@@ -10,6 +10,7 @@ from urllib.parse import quote
 import pandas as pd
 import yfinance as yf
 from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+from peewee import OperationalError as CacheOperationalError
 from pydantic import ValidationError
 from yfinance.exceptions import (
     YFDataException,
@@ -85,6 +86,10 @@ class YahooFinanceProvider:
                 MarketDataErrorCode.PROVIDER_UNAVAILABLE,
                 "Yahoo Finance request failed or timed out",
                 retryable=True,
+            ) from exc
+        except CacheOperationalError as exc:
+            raise MarketDataError(
+                MarketDataErrorCode.PROVIDER_UNAVAILABLE, "Yahoo Finance local cache was unavailable",
             ) from exc
         except YFDataException as exc:
             raise MarketDataError(

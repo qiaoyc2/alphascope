@@ -60,3 +60,30 @@ requests, two consecutive tool failures, two redundant or invalid proposals, and
 180 seconds. A budget stop preserves the partial state. A goal-satisfied stop
 requires scoped evidence. A contradicted price premise stops for clarification.
 See [M4 validation](docs/m4_validation.md) for the run results and stop conditions.
+
+## M5 research quality and evaluation
+
+`ResearchRun.quality` records whether an answer is sufficient, partial,
+insufficient, conflicted, or unsupported. The gate validates source and
+observation links, recomputes endpoint returns, and checks comparability across
+periods, price bases, and benchmarks. Findings retain evidence IDs and source
+limitations. An event date within a price interval supports a timing observation.
+Causal conclusions require evidence beyond timing and remain unresolved with
+the current sources.
+
+The runner keeps the raw action and registered tool proposal alongside any
+correction, the final disposition, and dispatch status. A failed or empty search
+does not establish factual absence. A truncated SEC excerpt cannot establish
+absence from the complete filing.
+
+```powershell
+.\.venv\Scripts\python.exe -B evals\run_evals.py --mode offline
+.\.venv\Scripts\python.exe -B evals\run_evals.py --mode local --repeat 2 --json m5-local.json
+.\.venv\Scripts\python.exe -B evals\run_evals.py --mode local --live-sources --repeat 1
+```
+
+Offline mode uses fixed cases and fixtures. Local mode uses the configured
+loopback Ollama model and fixture sources by default. The live-source option
+enables approved Yahoo and DOJ adapters for applicable cases. Other cases retain
+their labeled fixtures. See [M5 validation](docs/m5_validation.md) for the
+architecture, metric denominators, and measured results.

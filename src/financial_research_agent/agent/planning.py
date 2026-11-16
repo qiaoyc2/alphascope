@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Self
 from uuid import uuid4
@@ -21,7 +22,7 @@ from financial_research_agent.models import (
     ActionStatus, Evidence, Observation, ResearchAction, ResearchModel, ResearchState,
     ResearchType, ToolResult, _check_refs,
 )
-from financial_research_agent.providers.llm import LLMPerformance, LLMProvider
+from financial_research_agent.providers.llm import LLMPerformance, LLMProvider, ProposalMetadata
 from financial_research_agent.providers.market_data import PriceBasis
 from financial_research_agent.tools import ToolName
 from financial_research_agent.tools.planning import (
@@ -31,6 +32,10 @@ from financial_research_agent.tools.planning import (
 
 class PlanValidationError(ValueError):
     """A proposal failed validation against the current research state."""
+
+    def __init__(self, message: str, code: str = "invalid_proposal"):
+        super().__init__(message)
+        self.code = code
 
 
 class _PlanProposal(ResearchModel):
@@ -86,6 +91,7 @@ class PlanningResult(ResearchModel):
     decision: PlanDecision
     performance: LLMPerformance | None = None
     adjustment: str | None = None
+    correction_category: str | None = None
     blocked_tool: ToolName | None = None
     blocked_fingerprint: str | None = None
 
@@ -255,7 +261,7 @@ def _validated_arguments(state: ResearchState, tool: ToolName, arguments: dict) 
     try:
         return validate_tool_arguments(tool, arguments, state)
     except (ValueError, TypeError):
-        raise PlanValidationError(f"proposed arguments failed the {tool.value} contract") from None
+        raise PlanValidationError(f"proposed arguments failed the {tool.value} contract", "invalid_arguments") from None
 
 
 def _validate_scope(
@@ -270,7 +276,7 @@ def _validate_scope(
         or goal.end_date and arguments["end_date"] != goal.end_date.isoformat()
         or goal.benchmark and arguments.get("benchmark") != goal.benchmark.upper()
     ):
-        raise PlanValidationError("price premise needs market observations for the scoped ticker and dates")
+        raise PlanValidationError("price premise needs market observations for the scoped ticker and dates", "premise_required")
 
 
 def _scoped_price_arguments(
@@ -293,7 +299,10 @@ class ResearchPlanner:
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
-    def plan(self, state: ResearchState, *, execution: PlanningContext | None = None) -> PlanningResult:
+    def plan(
+        self, state: ResearchState, *, execution: PlanningContext | None = None,
+        on_proposal: Callable[[ProposalMetadata | None], None] | None = None,
+    ) -> PlanningResult:
         state = ResearchState.model_validate(state)
         assessment = assess_premise(state)
         if state.goal.needs_clarification:
@@ -310,6 +319,8 @@ class ResearchPlanner:
             generated = self.provider.generate(_prompt(state, assessment, scoped=True, execution=execution), ScopedPriceProposal)
             proposed_arguments = scoped_arguments if generated.decision.next_tool is ToolName.MARKET_DATA else {}
         proposal = generated.decision
+        if on_proposal is not None:
+            on_proposal(ProposalMetadata.from_payload(proposal.model_dump(mode="json")))
         if assessment.observations_conflict or assessment.conditional_valid is False:
             if assessment.observations_conflict:
                 gap = "Which measurements and calculation basis should be used?"
@@ -324,6 +335,7 @@ class ResearchPlanner:
             return PlanningResult(
                 decision=_clarify(assessment, GoalStatus.PREMISE_CONFLICT, reason, gap),
                 performance=generated.performance,
+                correction_category="premise_conflict" if requires_adjustment else None,
                 adjustment=(
                     f"Model proposed {proposal.recommended_action.value} with tool "
                     f"{proposal.next_tool.value if proposal.next_tool else 'none'} or included an incompatible update."
@@ -336,15 +348,15 @@ class ResearchPlanner:
         if tool is None and (proposed_arguments or proposal.purpose):
             adjustment = "Discarded tool details from a recommendation with no selected tool."
         if tool is not None and proposal.recommended_action in {RecommendedAction.CLARIFY, RecommendedAction.STOP}:
-            raise PlanValidationError("clarify and stop recommendations cannot request a tool")
+            raise PlanValidationError("clarify and stop recommendations cannot request a tool", "inconsistent_stop_decision")
         hypothesis_ids = {item.hypothesis_id for item in state.hypotheses}
         try:
             _check_refs(proposal.hypothesis_ids, hypothesis_ids, "hypothesis")
             _check_updates(state, proposal.hypothesis_updates)
         except ValueError:
-            raise PlanValidationError("proposal contains invalid hypothesis updates or references") from None
+            raise PlanValidationError("proposal contains invalid hypothesis updates or references", "invalid_evidence_reference") from None
         if scoped_arguments is not None and tool is not None and tool is not ToolName.MARKET_DATA:
-            raise PlanValidationError("price premise needs market observations for the scoped ticker and dates")
+            raise PlanValidationError("price premise needs market observations for the scoped ticker and dates", "premise_required")
         arguments = _validated_arguments(state, tool, proposed_arguments) if tool else {}
         if tool and _covered(state, tool, arguments):
             return PlanningResult(
@@ -376,8 +388,11 @@ class ResearchPlanner:
                 relevant_hypothesis_ids=proposal.hypothesis_ids, hypothesis_updates=proposal.hypothesis_updates,
             )
         except ValidationError:
-            raise PlanValidationError("model returned an inconsistent recommendation") from None
-        return PlanningResult(decision=decision, performance=generated.performance, adjustment=adjustment)
+            raise PlanValidationError("model returned an inconsistent recommendation", "inconsistent_stop_decision") from None
+        return PlanningResult(
+            decision=decision, performance=generated.performance, adjustment=adjustment,
+            correction_category="inconsistent_stop_decision" if adjustment else None,
+        )
 
 
 def _resolve_measured_gaps(state: ResearchState) -> ResearchState:

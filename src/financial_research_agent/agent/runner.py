@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
+from threading import Event
 from uuid import uuid4
 
 from pydantic import Field, ValidationError
@@ -22,13 +23,16 @@ from financial_research_agent.agent.planning import (
     GoalStatus, PlanDecision, PlanningContext, PlanValidationError, ResearchPlanner, record_plan,
 )
 from financial_research_agent.agent.premise import assess_premise
+from financial_research_agent.agent.quality import Disposition, QualityAssessment, QualityStatus, evaluate_quality
 from financial_research_agent.agent.state import add_research_gap, finish_research
 from financial_research_agent.llm_decision import RecommendedAction
 from financial_research_agent.models import (
     ExecutionMetadata, HypothesisStatus, ObservationOutcome, ResearchAction, ResearchGoal,
     ResearchModel, ResearchState, ResearchStatus, ResearchType, ToolError, ToolResult, utc_now,
 )
-from financial_research_agent.providers.llm import LLMError, LLMErrorCategory, LLMPerformance, LLMProvider
+from financial_research_agent.providers.llm import (
+    LLMError, LLMErrorCategory, LLMPerformance, LLMProvider, ProposalMetadata,
+)
 from financial_research_agent.tools import ToolName
 from financial_research_agent.tools.planning import action_fingerprint
 
@@ -52,6 +56,13 @@ class RunIssue(ResearchModel):
     step: int | None = None
 
 
+class RemainingBudget(ResearchModel):
+    steps: int
+    tool_calls: int
+    llm_requests: int
+    seconds: float
+
+
 class RunStep(ResearchModel):
     number: int
     recommended_action: RecommendedAction | None = None
@@ -63,6 +74,14 @@ class RunStep(ResearchModel):
     result_id: str | None = None
     observation_id: str | None = None
     hypothesis_changes: dict[str, HypothesisStatus] = Field(default_factory=dict)
+    raw_proposal: ProposalMetadata | None = None
+    raw_valid: bool | None = None
+    correction_category: str | None = None
+    final_disposition: str | None = None
+    authorized_tool: ToolName | None = None
+    tool_executed: bool = False
+    llm_performance: LLMPerformance | None = None
+    remaining_budget: RemainingBudget | None = None
 
 
 class RunStatistics(ResearchModel):
@@ -83,6 +102,7 @@ class ResearchRun(ResearchModel):
     statistics: RunStatistics
     steps: list[RunStep]
     issues: list[RunIssue]
+    quality: QualityAssessment | None = None
 
 
 @dataclass
@@ -98,6 +118,8 @@ class _Progress:
 
     def block(self, step: RunStep, code: str, reason: str) -> None:
         step.validation = "blocked"
+        step.raw_valid = False if step.raw_proposal is not None else None
+        step.correction_category = code
         step.note = reason
         self.rejected_proposals += 1
         self.flag(code, reason, step=step.number)
@@ -133,46 +155,21 @@ def _reassess_price_hypotheses(state: ResearchState) -> ResearchState:
     return state
 
 
-def _sufficient(state: ResearchState) -> bool:
-    """Conservative completion checks for the supported goal categories."""
-    premise = assess_premise(state)
-    if state.goal.needs_clarification or premise.observations_conflict or premise.conditional_valid is False:
-        return False
-    if state.goal.research_type is ResearchType.PRICE_COMPARISON:
-        return bool(premise.observation_ids)
-    source = {
-        ResearchType.REGULATORY: "news_source",
-        ResearchType.FILINGS: "sec_filings_source",
-    }.get(state.goal.research_type)
-    if source is None:
-        return False
-    action_map = {item.action_id: item for item in state.completed_actions}
-    observations = {
-        item.observation_id: item for item in state.observations if item.outcome is ObservationOutcome.DATA
-    }
-    for evidence in state.evidence:
-        if evidence.evidence_type != source:
-            continue
-        for observation_id in evidence.observation_ids:
-            observation = observations.get(observation_id)
-            if observation is None:
-                continue
-            args = action_map[observation.action_id].arguments
-            start, end = state.goal.start_date, state.goal.end_date
-            if (not start or args.get("start_date") == start.isoformat()) and (
-                not end or args.get("end_date") == end.isoformat()
-            ):
-                return True
-    return False
-
-
-def _decision_stop(state: ResearchState, decision: PlanDecision) -> tuple[StopReason, str] | None:
+def _decision_stop(
+    state: ResearchState, decision: PlanDecision, quality: QualityAssessment,
+) -> tuple[StopReason, str] | None:
+    if quality.recommended_disposition is Disposition.CLARIFY:
+        return StopReason.NEEDS_CLARIFICATION, decision.information_gap if decision.clarification_required else quality.reasons[0]
+    if quality.status is QualityStatus.UNSUPPORTED:
+        return StopReason.UNSUPPORTED_QUESTION, quality.reasons[0]
     if decision.clarification_required or decision.recommended_action is RecommendedAction.REVISE:
         return StopReason.NEEDS_CLARIFICATION, decision.information_gap or decision.reason
     if not decision.should_stop:
+        if quality.recommended_disposition is Disposition.STOP_UNRESOLVED:
+            return StopReason.INSUFFICIENT_EVIDENCE, quality.reasons[-1]
         return None
-    if not decision.information_gap and _sufficient(state):
-        return StopReason.GOAL_SATISFIED, decision.reason
+    if not decision.information_gap and quality.goal_satisfied:
+        return StopReason.GOAL_SATISFIED, quality.reasons[0]
     if state.observations and all(item.outcome is ObservationOutcome.FAILED for item in state.observations):
         return StopReason.TOOL_FAILURE, decision.information_gap or decision.reason
     if decision.goal_status is GoalStatus.UNSUPPORTED_GAP and not state.completed_actions:
@@ -182,15 +179,16 @@ def _decision_stop(state: ResearchState, decision: PlanDecision) -> tuple[StopRe
 
 def _make_result(
     progress: _Progress, budget: RunBudget, llm: BudgetedLLM, stop: tuple[StopReason, str],
+    tools: tuple[ToolName, ...],
 ) -> ResearchRun:
     reason, detail = stop
-    assessment = assess_premise(progress.state)
-    if reason is not StopReason.NEEDS_CLARIFICATION and (
-        assessment.observations_conflict or assessment.conditional_valid is False
-    ):
+    quality = evaluate_quality(progress.state, available_tools=tools)
+    if reason is not StopReason.NEEDS_CLARIFICATION and quality.recommended_disposition is Disposition.CLARIFY:
         reason = StopReason.NEEDS_CLARIFICATION
-        detail = (assessment.summary or "The price measurements disagree.") + " Confirm the intended price premise or scope."
+        detail = quality.reasons[0]
         progress.state = add_research_gap(progress.state, detail)
+    elif reason is StopReason.GOAL_SATISFIED and not quality.goal_satisfied:
+        reason, detail = StopReason.INSUFFICIENT_EVIDENCE, quality.reasons[0]
     status = ResearchStatus.STOPPED
     if reason is StopReason.GOAL_SATISFIED:
         status = ResearchStatus.COMPLETED
@@ -199,7 +197,7 @@ def _make_result(
     state = finish_research(progress.state, status, reason.value)
     performance = llm.performance
     return ResearchRun(
-        state=state, stop_reason=reason, stop_detail=detail, steps=progress.steps, issues=progress.issues,
+        state=state, stop_reason=reason, stop_detail=detail, steps=progress.steps, issues=progress.issues, quality=quality,
         statistics=RunStatistics(
             planning_steps=len(progress.steps), tool_calls=state.tool_call_count,
             provider_calls_reported=state.api_call_count, llm_requests=budget.llm_requests,
@@ -242,7 +240,7 @@ class ResearchRunner:
         except ValidationError:
             progress.flag("state_validation", "Research state failed validation.")
             stop = (StopReason.EXECUTION_ERROR, "The last valid research state was preserved.")
-        return _make_result(progress, budget, llm, stop)
+        return _make_result(progress, budget, llm, stop, self.tools.enabled)
 
     def _loop(
         self, progress: _Progress, budget: RunBudget, llm: BudgetedLLM,
@@ -261,49 +259,102 @@ class ResearchRunner:
                 seconds_remaining=round(remaining),
                 feedback=[item.message[:150] for item in progress.issues[-3:]],
             )
+            generations = len(llm.performance)
+            terminal = None
             try:
-                planned = planner.plan(progress.state, execution=context)
-            except PlanValidationError as exc:
-                progress.block(step, "invalid_proposal", str(exc))
-            except LLMError as exc:
-                if exc.category not in _MALFORMED:
-                    step.validation = "llm_failed"
-                    raise
-                progress.block(step, f"llm_{exc.category}", "The model produced malformed structured output.")
-                if progress.rejected_proposals >= limits.max_repeated_proposals:
-                    return StopReason.LLM_FAILURE, "The model repeatedly produced malformed output."
+                terminal = self._plan_step(progress, step, planner, context, budget)
             except (DeadlineExceeded, LLMRequestBudgetExceeded):
                 step.validation = "budget_exhausted"
+                step.final_disposition = StopReason.BUDGET_EXHAUSTED
                 raise
-            else:
-                step.recommended_action = planned.decision.recommended_action
-                step.proposed_tool = planned.blocked_tool or planned.decision.next_tool
-                step.note = planned.adjustment
-                if planned.blocked_tool is not None:
-                    step.fingerprint = planned.blocked_fingerprint
-                    progress.block(step, "duplicate_action", "An equivalent tool action was already covered.")
-                else:
-                    stop = self._accept(progress, step, planned.decision, budget)
-                    if stop is not None:
-                        return stop
-                    if step.validation != "blocked":
-                        progress.rejected_proposals = 0
-            if progress.rejected_proposals >= limits.max_repeated_proposals:
-                code = progress.issues[-1].code
-                reason = StopReason.REPEATED_ACTION if code == "duplicate_action" else StopReason.INVALID_PROPOSAL
-                return reason, "Repeated redundant or invalid proposals prevented progress."
+            except LLMError:
+                step.validation = "llm_failed"
+                step.final_disposition = StopReason.LLM_FAILURE
+                raise
+            except ValidationError:
+                step.final_disposition = StopReason.EXECUTION_ERROR
+                raise
+            finally:
+                if len(llm.performance) > generations:
+                    step.llm_performance = llm.performance[-1]
+                step.remaining_budget = RemainingBudget(
+                    steps=limits.max_steps - number,
+                    tool_calls=limits.max_tool_calls - progress.state.tool_call_count,
+                    llm_requests=limits.max_llm_requests - budget.llm_requests,
+                    seconds=max(0, round(limits.runtime_seconds - budget.elapsed, 6)),
+                )
+            step.final_disposition = terminal[0] if terminal else (
+                "execute_tool" if step.tool_executed else "retry_planning"
+            )
+            if terminal is not None:
+                return terminal
         return StopReason.BUDGET_EXHAUSTED, "The planning step limit was reached."
+
+    def _plan_step(
+        self, progress: _Progress, step: RunStep, planner: ResearchPlanner,
+        context: PlanningContext, budget: RunBudget,
+    ) -> tuple[StopReason, str] | None:
+        quality = evaluate_quality(progress.state, available_tools=self.tools.enabled)
+        try:
+            planned = planner.plan(
+                progress.state, execution=context,
+                on_proposal=lambda raw: setattr(step, "raw_proposal", raw),
+            )
+        except PlanValidationError as exc:
+            progress.block(step, exc.code, str(exc))
+        except LLMError as exc:
+            if exc.category not in _MALFORMED:
+                raise
+            step.raw_proposal = exc.proposal
+            code = "unsupported_tool" if exc.proposal and exc.proposal.unknown_tool else f"llm_{exc.category}"
+            progress.block(step, code, "The model produced malformed structured output.")
+            if progress.rejected_proposals >= budget.limits.max_repeated_proposals:
+                return StopReason.LLM_FAILURE, "The model repeatedly produced malformed output."
+        else:
+            step.recommended_action = planned.decision.recommended_action
+            step.note = planned.adjustment
+            step.correction_category = planned.correction_category
+            if planned.correction_category:
+                step.raw_valid = False
+                progress.flag(planned.correction_category, planned.adjustment or "The proposal was corrected.", step=step.number)
+            if planned.blocked_tool is not None:
+                step.fingerprint = planned.blocked_fingerprint
+                progress.block(step, "duplicate_action", "An equivalent tool action was already covered.")
+            else:
+                terminal = self._accept(progress, step, planned.decision, budget, quality)
+                if terminal is not None:
+                    return terminal
+                if step.validation != "blocked":
+                    progress.rejected_proposals = 0
+        finally:
+            if step.raw_proposal is not None:
+                step.proposed_tool = step.raw_proposal.tool
+
+        if quality.goal_satisfied and progress.state.goal.research_type is ResearchType.PRICE_COMPARISON:
+            return StopReason.GOAL_SATISFIED, quality.reasons[0]
+        if progress.rejected_proposals >= budget.limits.max_repeated_proposals:
+            code = progress.issues[-1].code
+            reason = StopReason.REPEATED_ACTION if code == "duplicate_action" else StopReason.INVALID_PROPOSAL
+            return reason, "Repeated redundant or invalid proposals prevented progress."
+        return None
 
     def _accept(
         self, progress: _Progress, step: RunStep, decision: PlanDecision, budget: RunBudget,
+        quality: QualityAssessment,
     ) -> tuple[StopReason, str] | None:
         before = progress.state
-        terminal = _decision_stop(before, decision)
+        terminal = _decision_stop(before, decision, quality)
         if terminal is not None:
-            # Apply any final assessment before deciding evidence sufficiency.
-            progress.state = record_plan(before, decision)
+            if step.raw_proposal and step.raw_proposal.requests_satisfaction and not quality.goal_satisfied:
+                progress.block(step, "quality_gate_rejection", quality.reasons[0])
+            elif decision.next_tool is not None:
+                progress.block(step, "quality_gate_rejection", quality.reasons[0])
+            elif step.raw_proposal and step.raw_valid is None:
+                step.raw_valid = True
+            if decision.next_tool is None:
+                progress.state = record_plan(before, decision)
             step.hypothesis_changes = _changes(before, progress.state)
-            return _decision_stop(progress.state, decision)
+            return terminal
 
         tool = decision.next_tool
         if tool is None:
@@ -318,11 +369,17 @@ class ResearchRunner:
             step.fingerprint = action_fingerprint(tool, decision.tool_arguments) if exc.code == "duplicate_action" else None
             progress.block(step, exc.code, str(exc))
             return None
+        if quality.goal_satisfied and before.goal.research_type is ResearchType.PRICE_COMPARISON:
+            progress.block(step, "quality_gate_rejection", "The factual return already has sufficient evidence.")
+            return StopReason.GOAL_SATISFIED, quality.reasons[0]
         budget.remaining_time()
         progress.state = record_plan(before, decision)
         action = progress.state.planned_actions[-1]
         step.action_id = action.action_id
         step.fingerprint = action_fingerprint(tool, args)
+        step.authorized_tool = tool
+        if step.raw_valid is None:
+            step.raw_valid = True
         return self._execute(progress, step, action, budget, before)
 
     def _execute(
@@ -331,15 +388,24 @@ class ResearchRunner:
     ) -> tuple[StopReason, str] | None:
         started = utc_now()
         timed_out = False
+        dispatched = Event()
+        pending = progress.state
+
+        def dispatch() -> ToolResult:
+            dispatched.set()
+            return self.tools.execute(pending, action)
+
         try:
-            pending = progress.state
-            result = budget.call(lambda: self.tools.execute(pending, action))
+            result = budget.call(dispatch)
         except DeadlineExceeded:
             timed_out = True
             result = _failure(action, "DEADLINE_EXCEEDED", started)
         except ActionRejected as exc:
+            dispatched.clear()
             progress.flag(exc.code, str(exc), step=step.number)
             result = _failure(action, exc.code, started)
+        finally:
+            step.tool_executed = dispatched.is_set()
         try:
             progress.state = observe_result(progress.state, action, result, self.tools.provenance(ToolName(action.tool_name)))
         except (ValidationError, ValueError):

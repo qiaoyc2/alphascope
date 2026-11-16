@@ -102,7 +102,7 @@ def _filing_finding(result: ToolResult) -> Finding:
     return Finding(summary, facts=facts)
 
 
-def _finding(result: ToolResult, provenance: ObservationProvenance) -> Finding:
+def describe_result(result: ToolResult, provenance: ObservationProvenance) -> Finding:
     if not result.success:
         assert result.error is not None
         return Finding(f"{result.tool_name} did not provide evidence ({result.error.code}).", ObservationOutcome.FAILED)
@@ -128,7 +128,7 @@ def observe_result(
     result = ToolResult.model_validate(result)
     if result.action_id != action.action_id or result.tool_name != action.tool_name:
         raise ValueError("tool result does not match the dispatched action")
-    finding = _finding(result, provenance)
+    finding = describe_result(result, provenance)
     observation = Observation(
         observation_id="o-" + uuid4().hex[:12], action_id=action.action_id, result_id=result.result_id,
         summary=finding.summary, provenance=provenance, outcome=finding.outcome,
@@ -138,7 +138,7 @@ def observe_result(
     evidence = []
     for fact in finding.facts:
         key = (fact.url, fact.claim)
-        if key in known:
+        if key in known and result.tool_name != ToolName.MARKET_DATA:
             continue
         known.add(key)
         evidence.append(Evidence(
@@ -146,6 +146,12 @@ def observe_result(
             evidence_type=f"{result.tool_name}_source", source_url=fact.url,
             observation_ids=[observation.observation_id],
             retrieved_at=fact.retrieved_at or result.recorded_at, event_at=fact.event_at,
+        ))
+    if result.success and result.tool_name == ToolName.CALCULATOR:
+        evidence.append(Evidence(
+            evidence_id="e-" + uuid4().hex[:12], claim=finding.summary,
+            evidence_type="calculation", observation_ids=[observation.observation_id],
+            calculation_method=result.data["operation"], calculation_inputs=result.data["inputs"],
         ))
 
     # A successful, non-empty observation can answer a narrowly scoped measurement

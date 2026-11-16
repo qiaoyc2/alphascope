@@ -284,6 +284,66 @@ def validate_calculation_arguments(arguments: dict) -> dict:
     return args.model_dump(mode="json")
 
 
+def calculate_values(arguments: dict) -> dict:
+    """Evaluate the calculator contract without creating an action or result."""
+    args = _ARGUMENT_ADAPTER.validate_python(arguments)
+    if isinstance(args, _PercentageReturnArgs):
+        value = percentage_return(args.starting_price, args.ending_price)
+        output = {
+            "value": value,
+            "unit": "percent",
+            "formula": "(end - start) / start * 100",
+        }
+    elif isinstance(args, _RelativePerformanceArgs):
+        value = relative_performance(args.stock_return_pct, args.benchmark_return_pct)
+        output = {
+            "value": value,
+            "unit": "percentage_points",
+            "formula": "stock_return_pct - benchmark_return_pct",
+        }
+    elif isinstance(args, _MovingAverageArgs):
+        output = {
+            "values": moving_average(args.prices, args.window),
+            "unit": "input_price_units",
+            "formula": "arithmetic mean of each complete window",
+        }
+    elif isinstance(args, _HistoricalVolatilityArgs):
+        value = historical_volatility(
+            args.prices,
+            annualize=args.annualize,
+            trading_periods_per_year=args.trading_periods_per_year,
+        )
+        output = {
+            "value": value,
+            "unit": "annualized_percent" if args.annualize else "periodic_percent",
+            "formula": (
+                "sample_sd(adjacent_simple_returns) * sqrt(periods_per_year) * 100"
+                if args.annualize
+                else "sample_sd(adjacent_simple_returns) * 100"
+            ),
+        }
+    elif isinstance(args, _VolumeChangeArgs):
+        output = {
+            "value": volume_change(args.current_volume, args.baseline_volumes),
+            "unit": "percent",
+            "formula": "(current / mean(baseline) - 1) * 100",
+        }
+    else:
+        correlation = return_correlation(args.stock_prices, args.benchmark_prices)
+        output = correlation.model_dump(mode="json")
+        output.update(
+            {
+                "unit": "correlation_coefficient",
+                "formula": "Pearson correlation of aligned simple returns",
+            }
+        )
+    return {
+        "operation": args.operation,
+        "inputs": args.model_dump(mode="json", exclude_none=True),
+        **output,
+    }
+
+
 class CalculatorTool:
     name = ToolName.CALCULATOR
 
@@ -292,63 +352,11 @@ class CalculatorTool:
             raise ValueError("action is not addressed to the calculator")
         started_at = utc_now()
         try:
-            args = _ARGUMENT_ADAPTER.validate_python(action.arguments)
+            data = calculate_values(action.arguments)
         except ValidationError:
             return self._failure(
                 action, "INVALID_ARGUMENTS", "Invalid calculator operation or arguments", started_at
             )
-
-        try:
-            if isinstance(args, _PercentageReturnArgs):
-                value = percentage_return(args.starting_price, args.ending_price)
-                output = {
-                    "value": value,
-                    "unit": "percent",
-                    "formula": "(end - start) / start * 100",
-                }
-            elif isinstance(args, _RelativePerformanceArgs):
-                value = relative_performance(args.stock_return_pct, args.benchmark_return_pct)
-                output = {
-                    "value": value,
-                    "unit": "percentage_points",
-                    "formula": "stock_return_pct - benchmark_return_pct",
-                }
-            elif isinstance(args, _MovingAverageArgs):
-                output = {
-                    "values": moving_average(args.prices, args.window),
-                    "unit": "input_price_units",
-                    "formula": "arithmetic mean of each complete window",
-                }
-            elif isinstance(args, _HistoricalVolatilityArgs):
-                value = historical_volatility(
-                    args.prices,
-                    annualize=args.annualize,
-                    trading_periods_per_year=args.trading_periods_per_year,
-                )
-                output = {
-                    "value": value,
-                    "unit": "annualized_percent" if args.annualize else "periodic_percent",
-                    "formula": (
-                        "sample_sd(adjacent_simple_returns) * sqrt(periods_per_year) * 100"
-                        if args.annualize
-                        else "sample_sd(adjacent_simple_returns) * 100"
-                    ),
-                }
-            elif isinstance(args, _VolumeChangeArgs):
-                output = {
-                    "value": volume_change(args.current_volume, args.baseline_volumes),
-                    "unit": "percent",
-                    "formula": "(current / mean(baseline) - 1) * 100",
-                }
-            else:
-                correlation = return_correlation(args.stock_prices, args.benchmark_prices)
-                output = correlation.model_dump(mode="json")
-                output.update(
-                    {
-                        "unit": "correlation_coefficient",
-                        "formula": "Pearson correlation of aligned simple returns",
-                    }
-                )
         except CalculationError as exc:
             return self._failure(action, exc.code.value, str(exc), started_at)
 
@@ -357,11 +365,7 @@ class CalculatorTool:
             action_id=action.action_id,
             tool_name=self.name,
             success=True,
-            data={
-                "operation": args.operation,
-                "inputs": args.model_dump(mode="json", exclude_none=True),
-                **output,
-            },
+            data=data,
             metadata=ExecutionMetadata(started_at=started_at, finished_at=utc_now()),
         )
 

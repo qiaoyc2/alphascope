@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from financial_research_agent.config import LLMSettings
 from financial_research_agent.providers.llm import (
-    DecisionT, LLMError, LLMErrorCategory, LLMPerformance, StructuredLLMResult,
+    DecisionT, LLMError, LLMErrorCategory, LLMPerformance, ProposalMetadata, StructuredLLMResult,
 )
 
 
@@ -67,6 +67,7 @@ class OllamaProvider:
             },
         }
         overall_start = time.perf_counter()
+        durations = []
         for attempt in range(1, self.settings.max_retries + 2):
             timeout = min(self.settings.timeout_seconds, before_attempt())
             start = time.perf_counter()
@@ -118,9 +119,10 @@ class OllamaProvider:
             output_tokens = _count(data, "eval_count")
             duration_ns = _count(data, "eval_duration")
             generation_seconds = duration_ns / 1e9 if duration_ns is not None else None
+            durations.append(time.perf_counter() - start)
             performance = LLMPerformance(
                 model=self.settings.model,
-                request_duration_seconds=time.perf_counter() - start,
+                request_duration_seconds=durations[-1],
                 total_duration_seconds=time.perf_counter() - overall_start,
                 attempts=attempt,
                 input_tokens=_count(data, "prompt_eval_count"),
@@ -130,13 +132,17 @@ class OllamaProvider:
                                    if output_tokens is not None and generation_seconds else None),
                 validation_passed=category is None,
                 error_category=category,
+                attempt_durations_seconds=tuple(durations),
             )
             # No prompt, response text, reasoning, exception body, or secrets.
             logger.info("llm_request %s", performance.model_dump_json())
             if category is None and decision is not None:
                 return StructuredLLMResult[schema](decision=decision, performance=performance)
             if not retryable or attempt > self.settings.max_retries:
-                raise LLMError(message, performance) from None
+                proposal = None
+                if category is LLMErrorCategory.SCHEMA_VALIDATION:
+                    proposal = ProposalMetadata.from_payload(json.loads(data["message"]["content"]))
+                raise LLMError(message, performance, proposal=proposal) from None
             time.sleep(0.25 * attempt)
         raise AssertionError("unreachable")
 

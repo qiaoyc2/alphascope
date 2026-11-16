@@ -55,6 +55,7 @@ class BenchmarkComparison(ResearchModel):
     benchmark_source_url: HttpUrl
     stock_retrieved_at: datetime
     benchmark_retrieved_at: datetime
+    adjustment_policy: str | None = None
 
 
 def compare_histories(
@@ -112,6 +113,7 @@ def compare_histories(
         benchmark_source_url=benchmark.source_url,
         stock_retrieved_at=stock.retrieved_at,
         benchmark_retrieved_at=benchmark.retrieved_at,
+        adjustment_policy=stock.adjustment_policy,
     )
 
 
