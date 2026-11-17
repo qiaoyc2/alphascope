@@ -34,6 +34,7 @@ class MovementReading:
     price_basis: PriceBasis | None = None
     effective_dates: tuple[date, date] | None = None
     adjustment_policy: str | None = None
+    session_count: int | None = None
 
     @property
     def scope(self) -> tuple:
@@ -67,6 +68,7 @@ def market_reading(observation: Observation, result: ToolResult) -> MovementRead
         return MovementReading(
             observation, movement, item.price_basis, (item.effective_start_date, item.effective_end_date),
             item.adjustment_policy if item.price_basis is PriceBasis.ADJUSTED_CLOSE else None,
+            session_count=item.common_session_count,
         )
     if kind == "price_history":
         history = PriceHistory.model_validate(data)
@@ -78,6 +80,7 @@ def market_reading(observation: Observation, result: ToolResult) -> MovementRead
             return MovementReading(
                 observation, movement, PriceBasis.ADJUSTED_CLOSE,
                 (history.actual_start_date, history.actual_end_date), history.adjustment_policy,
+                session_count=len(history.bars),
             )
     return None
 

@@ -59,6 +59,21 @@ def test_partial_endpoint_coverage_does_not_complete_the_requested_return():
     assert run.steps[-1].correction_category == "quality_gate_rejection"
 
 
+@pytest.mark.parametrize("question", [
+    f"What was the adjusted closing price return for GOOGL from {SPAN} and the price path?",
+    f"Analyze GOOGL performance from {SPAN}.",
+    f"Show the complete historical return and market analysis for GOOGL from {SPAN}.",
+])
+def test_two_endpoint_prices_do_not_complete_broader_historical_analysis(question):
+    goal, first, stop = json.loads(CASES[2].offline_proposals_json)
+    run = ResearchRunner(Model(goal, first, stop), registry(price=FixturePrices(ending_price=106))).run(question)
+    assert run.stop_reason is StopReason.INSUFFICIENT_EVIDENCE
+    assert run.quality.status == "partial"
+    assert "+6.00%" in run.quality.supported_findings[0].statement
+    assert any("intervening trading sessions" in need for need in run.quality.remaining_needs)
+    assert run.steps[-1].correction_category == "quality_gate_rejection"
+
+
 def test_contradicted_premise_keeps_conditional_provenance_without_planning_again():
     model = Model(draft(), SEEDS, plan("market_data"))
     run = ResearchRunner(model, registry(price=FixturePrices(ending_price=103))).run(PRICE_Q)

@@ -87,3 +87,19 @@ loopback Ollama model and fixture sources by default. The live-source option
 enables approved Yahoo and DOJ adapters for applicable cases. Other cases retain
 their labeled fixtures. See [M5 validation](docs/m5_validation.md) for the
 architecture, metric denominators, and measured results.
+
+## M6 evidence-grounded research reports
+
+Use the existing demo to render a cited Markdown or structured JSON report.
+The fixture scenarios use simulated data and local Ollama.
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 examples\autonomous_research_demo.py --scenario fixture-return --report
+.\.venv\Scripts\python.exe -X utf8 examples\autonomous_research_demo.py --scenario fixture-doj --report-json --output-dir reports
+```
+
+Ollama can prioritize validated findings. The report retains the original
+evidence, scope and caveats when drafting fails. Use `--from-run` with a full
+`ResearchRun` JSON file to reuse research and `--deterministic-report` to skip
+drafting. File export requires `--overwrite` to replace an existing report.
+See [M6 validation](docs/m6_validation.md) for the API, checks and results.

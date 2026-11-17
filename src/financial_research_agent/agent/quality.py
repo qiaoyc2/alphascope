@@ -165,10 +165,26 @@ _OTHER_PRICE_METRICS = re.compile(
     r"\b(?:annualiz\w*|total shareholder|total return|volatility|drawdown|dividends?|volume|intraday|daily|"
     r"weekly|monthly|opening|highest|lowest|correlation|risk|average|median|in dollars)\b", re.I,
 )
+_PRICE_PATH = re.compile(
+    r"\b(?:price history|trading history|price path|market analysis|trend\w*|"
+    r"(?:price|market|stock|performance) analysis|(?:price|return|time) series|"
+    r"(?:day[- ]by[- ]day|session[- ]by[- ]session)|intermediate (?:closing )?prices)\b", re.I,
+)
 
 
 def _mentions(text: str, terms: set[str]) -> bool:
     return any(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text, re.I) for term in terms)
+
+
+def _asks_for_endpoint_return(query: str, ticker: str | None) -> bool:
+    if not ticker:
+        return False
+    return bool(re.match(
+        r"^\s*(?:(?:what (?:was|is)|calculate|compute|report|find|show(?: me)?|give(?: me)?)\s+)?"
+        rf"(?:the\s+)?(?:\$?{re.escape(ticker)}(?:['’]s)?\s+)?"
+        r"(?:(?:historical|endpoint|point[- ]to[- ]point|simple|stock|adjusted|unadjusted|raw|closing|close|price)\s+)*return\b",
+        query, re.I,
+    ))
 
 
 def _retrieve(
@@ -231,7 +247,21 @@ def _retrieve(
                 for field, value in (("start_date", goal.start_date), ("end_date", goal.end_date))
             ):
                 assess.relevance = Relevance.RELEVANT
-            assess.limitations.append("Returns use available endpoint sessions within the requested interval.")
+            reading = item.movement
+            if reading and reading.effective_dates:
+                first, last = reading.effective_dates
+                symbol = f"{args['ticker']} versus {args['benchmark']}" if benchmark else args["ticker"]
+                if reading.session_count == 2:
+                    assess.limitations.append(
+                        f"Observed coverage for {symbol} consists of two closing-price observations, on {first} and {last}. "
+                        "These prices support an endpoint return. The intervening price path is unobserved."
+                    )
+                else:
+                    session_type = "aligned sessions" if benchmark else "sessions"
+                    assess.limitations.append(
+                        f"Observed coverage for {symbol} includes {reading.session_count} recorded {session_type} "
+                        f"from {first} to {last}. Trading-calendar completeness is unverified."
+                    )
         elif tool is ToolName.NEWS:
             if kind != "news_search" or result.data.get("query") != args["query"]:
                 raise ValueError("news result differs from the action")
@@ -624,13 +654,19 @@ def _outcome(
             (readings[0].effective_dates[0] - goal.start_date).days <= 4
             and (goal.end_date - readings[0].effective_dates[1]).days <= 4
         )
+        endpoint_only = readings and all(item.session_count == 2 for item in readings)
+        needs_price_path = bool(_PRICE_PATH.search(query) or _EXHAUSTIVE.search(query))
+        endpoint_request = endpoint_only and _asks_for_endpoint_return(query, goal.ticker)
         if (covered and len({item.scope for item in readings}) == 1 and dates_match and simple_request and _RETURN.search(query)
+            and not needs_price_path and (not endpoint_only or endpoint_request)
             and not _OTHER_PRICE_METRICS.search(query)
             and goal.ticker and _mentions(query, {goal.ticker})
             and (basis is None or readings[0].price_basis is basis)
             and (not comparative or (goal.benchmark and _mentions(query, {goal.benchmark})))):
             return QualityStatus.SUFFICIENT, Disposition.COMPLETE, []
         needs = ["Verify the requested ticker, period and calculation basis with matching price data."]
+        if endpoint_only and (needs_price_path or not endpoint_request):
+            needs.append("Verify intervening trading sessions before drawing conclusions about the price path.")
     elif goal.research_type is ResearchType.REGULATORY:
         preferred = {ToolName.NEWS}
         if (dates_match and simple_request and any(item.kind is ClaimKind.EVENT_RECORD for item in scoped_findings)

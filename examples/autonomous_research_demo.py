@@ -1,15 +1,20 @@
-"""Run one bounded M4 scenario and display its read-only research trace."""
+"""Run bounded research and display a trace or an evidence-grounded report."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sys
 from collections.abc import Sequence
 from datetime import date
+from pathlib import Path
 
 from financial_research_agent.agent.budget import ResearchLimits
 from financial_research_agent.agent.dispatch import ToolRegistry
+from financial_research_agent.agent.report import render_report_markdown
+from financial_research_agent.agent.report_export import export_research_report
+from financial_research_agent.agent.report_narrative import generate_research_report
 from financial_research_agent.agent.runner import ResearchRun, ResearchRunner
 from financial_research_agent.config import load_llm_settings, open_llm_provider
 from financial_research_agent.models import ObservationProvenance, utc_now
@@ -34,6 +39,8 @@ SCENARIOS = {
     "live-doj": "What official DOJ press-release titles mention Google from 2024-01-01 to 2026-10-12?",
     "fixture": "Why did GOOGL decline from 2026-08-28 to 2026-10-12?",
     "fixture-rise": "Why did GOOGL decline from 2026-08-28 to 2026-10-12?",
+    "fixture-return": "What was the historical adjusted closing price return for GOOGL from 2026-08-28 to 2026-10-12?",
+    "fixture-doj": "What DOJ press-release titles mention Google from 2024-01-01 to 2026-10-12?",
     "failure": "Why did GOOGL decline from 2026-08-28 to 2026-10-12?",
 }
 
@@ -108,8 +115,14 @@ class FixtureFilings:
 
 def build_tools(scenario: str) -> ToolRegistry:
     calculator = CalculatorTool()
+    fixture = ObservationProvenance.SIMULATED_FIXTURE
+    if scenario == "fixture-return":
+        return ToolRegistry(
+            market_data=MarketDataTool(FixturePrices(ending_price=106)), provenance={ToolName.MARKET_DATA: fixture},
+        )
+    if scenario == "fixture-doj":
+        return ToolRegistry(news=NewsTool(FixtureNews()), provenance={ToolName.NEWS: fixture})
     if scenario in {"fixture", "fixture-rise", "failure"}:
-        fixture = ObservationProvenance.SIMULATED_FIXTURE
         return ToolRegistry(
             market_data=MarketDataTool(FixturePrices(failed=scenario == "failure", ending_price=103 if scenario == "fixture-rise" else 94)),
             calculator=calculator,
@@ -175,21 +188,70 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--tool-calls", type=int, default=5)
     parser.add_argument("--llm-requests", type=int, default=8)
     parser.add_argument("--seconds", type=float, default=180)
-    parser.add_argument("--json", action="store_true")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="Print the existing machine-readable research trace.")
+    output.add_argument("--report", action="store_true", help="Print a cited Markdown research report.")
+    output.add_argument("--report-json", action="store_true", help="Print the structured research report as JSON.")
+    parser.add_argument("--from-run", type=Path, help="Load a full ResearchRun JSON file and reuse its research.")
+    parser.add_argument("--output-dir", type=Path, help="Also export the selected report format to this directory.")
+    parser.add_argument("--overwrite", action="store_true", help="Replace an existing report file for this run.")
+    parser.add_argument("--deterministic-report", action="store_true", help="Render without requesting a narrative draft.")
     args = parser.parse_args(argv)
-    try:
-        limits = ResearchLimits(
-            max_steps=args.steps, max_tool_calls=args.tool_calls, max_llm_requests=args.llm_requests,
-            runtime_seconds=args.seconds,
-        )
-        settings = load_llm_settings()
-    except ValueError:
-        parser.error("Invalid research limits or local LLM configuration.")
-    with open_llm_provider(settings) as provider:
-        run = ResearchRunner(provider, build_tools(args.scenario)).run(
-            args.question or SCENARIOS[args.scenario], limits,
-        )
-    report(run, args.scenario, args.json)
+    wants_report = args.report or args.report_json
+    if not wants_report and (args.from_run or args.output_dir or args.overwrite or args.deterministic_report):
+        parser.error("Replay, export, and report options require --report or --report-json.")
+    if args.overwrite and not args.output_dir:
+        parser.error("--overwrite requires --output-dir.")
+    if args.from_run and args.question:
+        parser.error("--from-run uses the saved research question.")
+
+    if args.from_run:
+        try:
+            run = ResearchRun.model_validate_json(args.from_run.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            parser.error("The input must be a readable full ResearchRun JSON file.")
+        if args.deterministic_report:
+            research_report = generate_research_report(run)
+        else:
+            try:
+                settings = load_llm_settings()
+            except ValueError:
+                research_report = generate_research_report(run, narrative_requested=True)
+            else:
+                with open_llm_provider(settings) as provider:
+                    research_report = generate_research_report(run, provider)
+    else:
+        try:
+            limits = ResearchLimits(
+                max_steps=args.steps, max_tool_calls=args.tool_calls, max_llm_requests=args.llm_requests,
+                runtime_seconds=args.seconds,
+            )
+            settings = load_llm_settings()
+        except ValueError:
+            parser.error("Invalid research limits or local LLM configuration.")
+        with open_llm_provider(settings) as provider:
+            run = ResearchRunner(provider, build_tools(args.scenario)).run(
+                args.question or SCENARIOS[args.scenario], limits,
+            )
+            if wants_report:
+                research_report = generate_research_report(run, None if args.deterministic_report else provider)
+    if wants_report:
+        if args.output_dir:
+            try:
+                destination = export_research_report(
+                    research_report, args.output_dir, format="json" if args.report_json else "md", overwrite=args.overwrite,
+                )
+            except FileExistsError:
+                parser.error("A report file already exists. Use --overwrite to replace it.")
+            except OSError:
+                parser.error("The report could not be written to the requested directory.")
+            print(f"Saved {destination}", file=sys.stderr)
+        if args.report_json:
+            print(json.dumps(research_report.model_dump(mode="json"), ensure_ascii=True))
+        else:
+            print(render_report_markdown(research_report), end="")
+    else:
+        report(run, args.scenario, args.json)
     return 0
 
 
